@@ -1,0 +1,61 @@
+name: Manage EKS Cluster
+
+on:
+  workflow_dispatch:
+    inputs:
+      clusterName:
+        description: 'Name of the EKS cluster'
+        required: true
+      awsRegion:
+        description: 'AWS Region for the cluster'
+        required: true
+      action:
+        description: 'Action to perform (apply/destroy)'
+        required: true
+
+jobs:
+  apply_cluster:
+    runs-on: ubuntu-latest
+    if: ${{ github.event.inputs.action == 'apply' }}
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v2
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v1
+      with:
+        cli_config_credentials_token: ${{ secrets.TF_API_TOKEN }}
+    - name: Terraform Init
+      run: terraform init
+      working-directory: Terraform
+    - name: Terraform Format
+      run: terraform fmt
+      working-directory: Terraform
+    - name: Terraform Validate
+      run: terraform validate
+      working-directory: Terraform
+    - name: Terraform Apply
+      run: terraform apply -var clusterName=${{ github.event.inputs.clusterName }} -var awsRegion=${{ github.event.inputs.awsRegion }} -auto-approve
+      working-directory: Terraform
+
+  destroy_cluster:
+    runs-on: ubuntu-latest
+    if: ${{ github.event.inputs.action == 'destroy' }}
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v2
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v1
+      with:
+        cli_config_credentials_token: ${{ secrets.TF_API_TOKEN }}
+    - name: Terraform Init
+      run: terraform init
+      working-directory: Terraform
+    - name: Terraform FMT
+      run: terraform fmt
+      working-directory: Terraform
+    - name: Terraform Validate
+      run: terraform validate
+      working-directory: Terraform
+    - name: Terraform Destroy
+      run: terraform destroy -var clusterName=${{ github.event.inputs.clusterName }} -var awsRegion=${{ github.event.inputs.awsRegion }} -auto-approve
+      working-directory: Terraform
