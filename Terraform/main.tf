@@ -5,7 +5,7 @@ terraform {
 
     # The name of the Terraform Cloud workspace to store Terraform state files in.
     workspaces {
-      name = "backstage-eks-aws"
+      name = "eks-demo"
     }
   }
 }
