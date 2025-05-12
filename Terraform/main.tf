@@ -4,6 +4,10 @@ terraform {
       source  = "hashicorp/aws"
       version = ">= 4.57.0"
     }
+    kubernetes = {
+      source  = "hashicorp/kubernetes"
+      version = ">= 2.10"
+    }
   }
   backend "remote" {
     # The name of your Terraform Cloud organization.
@@ -19,6 +23,18 @@ terraform {
 # Adding the AWS provider configuration
 provider "aws" {
   region = var.region
+}
+
+# Get EKS cluster authentication token
+data "aws_eks_cluster_auth" "cluster" {
+  name = module.eks.cluster_name
+}
+
+# Configure Kubernetes provider with EKS details
+provider "kubernetes" {
+  host                   = module.eks.cluster_endpoint
+  cluster_ca_certificate = base64decode(module.eks.cluster_certificate_authority_data)
+  token                  = data.aws_eks_cluster_auth.cluster.token
 }
 
 module "vpc" {
@@ -76,8 +92,8 @@ module "eks" {
     }
   }
 
-  # aws-auth configmap
-  manage_aws_auth_configmap = true
+  # Disable aws-auth configmap management to avoid the connection error
+  manage_aws_auth_configmap = false
 
   tags = {
     Environment = "dev"
