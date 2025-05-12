@@ -1,4 +1,10 @@
 terraform {
+  required_providers {
+    aws = {
+      source = "hashicorp/aws"
+      version = ">= 4.57.0"
+    }
+  }
   backend "remote" {
     # The name of your Terraform Cloud organization.
     organization = "Honours"
