@@ -18,7 +18,7 @@ variable "cluster_name" {
 
 variable "instance_types" {
   description = "EC2 instances used for K8s nodes"
-  type        = list
+  type        = list(string)
   default     = ["t2.small"]
 }
 
