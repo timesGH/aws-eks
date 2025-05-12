@@ -20,10 +20,6 @@ on:
           - apply
           - destroy
 
-env:
-  AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-  AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-
 jobs:
   apply_cluster:
     runs-on: ubuntu-latest
@@ -37,47 +33,22 @@ jobs:
       with:
         cli_config_credentials_token: ${{ secrets.TF_API_TOKEN }}
     
-    - name: Configure AWS credentials
-      uses: aws-actions/configure-aws-credentials@v4
-      with:
-        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-        aws-region: ${{ github.event.inputs.awsRegion }}
-    
     - name: Create terraform.auto.tfvars
       run: |
         echo 'cluster_name = "${{ github.event.inputs.clusterName }}"' > terraform.auto.tfvars
         echo 'region = "${{ github.event.inputs.awsRegion }}"' >> terraform.auto.tfvars
-      working-directory: Terraform
     
     - name: Terraform Init
       run: terraform init -upgrade
-      working-directory: Terraform
     
     - name: Terraform Format
       run: terraform fmt
-      working-directory: Terraform
     
     - name: Terraform Validate
       run: terraform validate
-      working-directory: Terraform
     
     - name: Terraform Apply
       run: terraform apply -auto-approve
-      working-directory: Terraform
-    
-    - name: Install kubectl
-      if: success()
-      uses: azure/setup-kubectl@v3
-      with:
-        version: 'v1.27.0'
-    
-    - name: Post-deployment configuration
-      if: success()
-      run: |
-        chmod +x post-deploy.sh
-        ./post-deploy.sh
-      working-directory: Terraform
 
   destroy_cluster:
     runs-on: ubuntu-latest
@@ -90,13 +61,6 @@ jobs:
       uses: hashicorp/setup-terraform@v2
       with:
         cli_config_credentials_token: ${{ secrets.TF_API_TOKEN }}
-    
-    - name: Configure AWS credentials
-      uses: aws-actions/configure-aws-credentials@v4
-      with:
-        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-        aws-region: ${{ github.event.inputs.awsRegion }}
     
     - name: Create terraform.auto.tfvars
       run: |
@@ -119,3 +83,7 @@ jobs:
     - name: Terraform Destroy
       run: terraform destroy -auto-approve
       working-directory: Terraform
+
+defaults:
+  run:
+    working-directory: Terraform
