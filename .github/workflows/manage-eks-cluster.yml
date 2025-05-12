@@ -31,6 +31,11 @@ jobs:
       uses: hashicorp/setup-terraform@v2
       with:
         cli_config_credentials_token: ${{ secrets.TF_API_TOKEN }}
+    - name: Create terraform.auto.tfvars
+      run: |
+        echo 'cluster_name = "${{ github.event.inputs.clusterName }}"' > terraform.auto.tfvars
+        echo 'region = "${{ github.event.inputs.awsRegion }}"' >> terraform.auto.tfvars
+      working-directory: Terraform
     - name: Terraform Init
       run: terraform init -upgrade
       working-directory: Terraform
@@ -41,7 +46,7 @@ jobs:
       run: terraform validate
       working-directory: Terraform
     - name: Terraform Apply
-      run: terraform apply -var="cluster_name=${{ github.event.inputs.clusterName }}" -var="region=${{ github.event.inputs.awsRegion }}" -auto-approve
+      run: terraform apply -auto-approve
       working-directory: Terraform
 
   destroy_cluster:
@@ -54,6 +59,11 @@ jobs:
       uses: hashicorp/setup-terraform@v2
       with:
         cli_config_credentials_token: ${{ secrets.TF_API_TOKEN }}
+    - name: Create terraform.auto.tfvars
+      run: |
+        echo 'cluster_name = "${{ github.event.inputs.clusterName }}"' > terraform.auto.tfvars
+        echo 'region = "${{ github.event.inputs.awsRegion }}"' >> terraform.auto.tfvars
+      working-directory: Terraform
     - name: Terraform Init
       run: terraform init -upgrade
       working-directory: Terraform
@@ -64,5 +74,5 @@ jobs:
       run: terraform validate
       working-directory: Terraform
     - name: Terraform Destroy
-      run: terraform destroy -var="cluster_name=${{ github.event.inputs.clusterName }}" -var="region=${{ github.event.inputs.awsRegion }}" -auto-approve
+      run: terraform destroy -auto-approve
       working-directory: Terraform
