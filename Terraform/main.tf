@@ -1,7 +1,7 @@
 terraform {
   backend "remote" {
     # The name of your Terraform Cloud organization.
-    organization = "Honours"
+    organization = "YOUR_ORGANIZATION_NAME"
 
     # The name of the Terraform Cloud workspace to store Terraform state files in.
     workspaces {
@@ -11,15 +11,31 @@ terraform {
 }
 
 module "eks" {
-  source  = "app.terraform.io/TeKanAid/eks/aws"
-  version = "0.0.7"
+  source  = "terraform-aws-modules/eks/aws"
+  version = "~> 19.0"
 
-  region               = "us-east-1"
-  cluster_version      = "1.27"
-  cluster_name         = "my_eks_cluster"
-  instance_types       = ["t2.small"]
-  vpc_cidr             = "10.0.0.0/16"
-  cluster_min_size     = 1
-  cluster_max_size     = 3
-  cluster_desired_size = 2
+  cluster_name    = var.cluster_name
+  cluster_version = var.cluster_version
+
+  cluster_endpoint_public_access = true
+
+  vpc_cidr = var.vpc_cidr
+  
+  # EKS Managed Node Group(s)
+  eks_managed_node_groups = {
+    default = {
+      min_size       = var.cluster_min_size
+      max_size       = var.cluster_max_size
+      desired_size   = var.cluster_desired_size
+      instance_types = var.instance_types
+    }
+  }
+
+  # aws-auth configmap
+  manage_aws_auth_configmap = true
+
+  tags = {
+    Environment = "dev"
+    Project     = "eks-demo"
+  }
 }
