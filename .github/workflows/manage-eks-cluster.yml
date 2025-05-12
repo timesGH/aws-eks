@@ -1,4 +1,6 @@
 name: Manage EKS Cluster
+run: terraform init -upgrade
+working-directory: Terraform
 
 on:
   workflow_dispatch:
