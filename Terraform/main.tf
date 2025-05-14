@@ -100,3 +100,18 @@ module "eks" {
     Project     = "eks-demo"
   }
 }
+
+# Create ECR repository for application images
+resource "aws_ecr_repository" "app_repository" {
+  name                 = var.app_name
+  image_tag_mutability = "MUTABLE"
+  
+  image_scanning_configuration {
+    scan_on_push = true
+  }
+  
+  tags = {
+    Environment = "dev"
+    Project     = "eks-demo"
+  }
+}
