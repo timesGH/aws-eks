@@ -14,12 +14,12 @@ on:
       action:
         description: 'Action to perform'
         required: true
-        default: 'deploy_all'
+        default: 'deploy'
         type: choice
         options:
-          - deploy_all
-          - deploy_app_only
-          - destroy_all
+          - deploy
+          - update-app-only
+          - destroy
   push:
     branches: [ main ]
     paths:
@@ -27,13 +27,13 @@ on:
       - 'kubernetes/**'
       - 'Dockerfile'
       - 'package.json'
-      - '*.tf'
 
 jobs:
-  terraform:
-    name: 'Terraform Cloud Infrastructure'
+  terraform_provision:
+    name: 'Provision EKS with Terraform Cloud'
     runs-on: ubuntu-latest
-    if: ${{ github.event.inputs.action == 'deploy_all' || github.event.inputs.action == 'destroy_all' || (github.event_name == 'push' && contains(join(github.event.commits.*.modified, ','), '.tf')) }}
+    # Skip infrastructure provisioning if we're only updating the app
+    if: ${{ github.event.inputs.action != 'update-app-only' && (github.event_name != 'push' || github.event.inputs.action == 'deploy') }}
     
     steps:
     - name: Checkout code
@@ -64,42 +64,49 @@ jobs:
 
     - name: Terraform Plan
       id: plan
-      if: ${{ github.event.inputs.action != 'destroy_all' }}
+      if: github.event.inputs.action == 'deploy'
       run: |
         terraform plan -var-file="terraform.tfvars" -input=false -out=tfplan
       continue-on-error: true
 
     - name: Terraform Apply
       id: apply
-      if: ${{ github.event.inputs.action != 'destroy_all' }}
+      if: github.event.inputs.action == 'deploy'
       run: |
         terraform apply -auto-approve tfplan
       
     - name: Terraform Destroy
       id: destroy
-      if: ${{ github.event.inputs.action == 'destroy_all' }}
+      if: github.event.inputs.action == 'destroy'
       run: |
         terraform destroy -var-file="terraform.tfvars" -auto-approve
 
     - name: Post-deployment configuration
-      if: ${{ github.event.inputs.action != 'destroy_all' && steps.apply.outcome == 'success' }}
+      if: github.event.inputs.action == 'deploy'
       run: |
         chmod +x ./post-deploy.sh
         ./post-deploy.sh
-    
+
     - name: Output Cluster Info
-      if: ${{ github.event.inputs.action != 'destroy_all' && steps.apply.outcome == 'success' }}
+      if: github.event.inputs.action == 'deploy'
       run: |
         echo "Cluster Endpoint: $(terraform output -raw cluster_endpoint)"
         echo "Cluster Name: $(terraform output -raw cluster_name)"
-        echo "::set-output name=cluster_name::$(terraform output -raw cluster_name)"
-        echo "::set-output name=cluster_region::$(terraform output -raw region)"
-        
-  build_and_deploy:
-    name: 'Build and Deploy App'
+        # Export these as environment variables for the next job
+        echo "CLUSTER_NAME=$(terraform output -raw cluster_name)" >> $GITHUB_ENV
+        echo "CLUSTER_REGION=$(terraform output -raw region)" >> $GITHUB_ENV
+
+  deploy_nodejs:
+    name: 'Deploy Node.js App'
     runs-on: ubuntu-latest
-    needs: [terraform]
-    if: ${{ success() && (github.event.inputs.action == 'deploy_all' || github.event.inputs.action == 'deploy_app_only' || github.event_name == 'push') }}
+    needs: [terraform_provision]
+    if: |
+      always() && 
+      (github.event.inputs.action == 'deploy' || 
+       github.event.inputs.action == 'update-app-only' || 
+       github.event_name == 'push') && 
+      (needs.terraform_provision.result == 'success' || 
+       needs.terraform_provision.result == 'skipped')
     
     steps:
     - name: Checkout code
@@ -110,7 +117,21 @@ jobs:
       with:
         aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
         aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-        aws-region: ${{ github.event.inputs.awsRegion || 'us-east-1' }}
+        aws-region: ${{ github.event.inputs.awsRegion || env.CLUSTER_REGION || 'us-east-1' }}
+    
+    - name: Setup Terraform for cluster info
+      if: github.event.inputs.action == 'update-app-only' || github.event_name == 'push'
+      uses: hashicorp/setup-terraform@v2
+      with:
+        cli_config_credentials_token: ${{ secrets.TF_API_TOKEN }}
+    
+    - name: Get cluster info if updating app only
+      if: github.event.inputs.action == 'update-app-only' || github.event_name == 'push'
+      run: |
+        # Initialize terraform to read state
+        terraform init
+        echo "CLUSTER_NAME=$(terraform output -raw cluster_name)" >> $GITHUB_ENV
+        echo "CLUSTER_REGION=$(terraform output -raw region)" >> $GITHUB_ENV
     
     - name: Login to Amazon ECR
       id: login-ecr
@@ -139,7 +160,7 @@ jobs:
     
     - name: Update kubeconfig
       run: |
-        aws eks update-kubeconfig --region ${{ github.event.inputs.awsRegion || 'us-east-1' }} --name ${{ github.event.inputs.clusterName || needs.terraform.outputs.cluster_name || 'my_eks_cluster' }}
+        aws eks update-kubeconfig --region ${{ env.CLUSTER_REGION || github.event.inputs.awsRegion }} --name ${{ env.CLUSTER_NAME || github.event.inputs.clusterName }}
     
     - name: Update Kubernetes manifests
       run: |
@@ -165,12 +186,14 @@ jobs:
     - name: Verify deployment
       run: |
         APP_NAME=$(basename ${{ github.repository }} | tr '[:upper:]' '[:lower:]' | sed 's/[^a-zA-Z0-9-]/-/g')
-        kubectl rollout status deployment/$APP_NAME
+        kubectl rollout status deployment/$APP_NAME --timeout=180s
     
     - name: Get Service URL
       run: |
         APP_NAME=$(basename ${{ github.repository }} | tr '[:upper:]' '[:lower:]' | sed 's/[^a-zA-Z0-9-]/-/g')
-        echo "Application deployed successfully!"
+        echo "====== Application Deployment Complete ======"
         echo "Service URL:"
         kubectl get service $APP_NAME-service -o jsonpath="{.status.loadBalancer.ingress[0].hostname}"
         echo ""
+        echo "It may take a few minutes for the Load Balancer to be fully provisioned and the URL to become available."
+        echo "=============================================="
