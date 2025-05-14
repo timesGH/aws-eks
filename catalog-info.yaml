@@ -1,23 +1,15 @@
 apiVersion: backstage.io/v1alpha1
 kind: Component
 metadata:
-  name: ${{ values.name | lower | replace(' ', '-') }}
+  name: dev-eks-cluster
   annotations:
-    github.com/project-slug: ${{ values.destination.owner }}/${{ values.destination.repo }}
-    backstage.io/kubernetes-id: ${{ values.name | lower | replace(' ', '-') }}
-    backstage.io/kubernetes-namespace: default
-  description: ${{ values.description }}
+    github.com/project-slug: samgabrail/aws-eks
+  description: AWS EKS cluster managed by Terraform
   tags:
-    - nodejs
     - aws
     - eks
-    - kubernetes
     - terraform
 spec:
   type: service
   lifecycle: experimental
-  owner: guest
-  system: cloud-infrastructure
-  dependsOn:
-    - component:aws-eks-infrastructure
-    - resource:${{ values.clusterName }}
+  owner: guests
