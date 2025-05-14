@@ -1,4 +1,4 @@
-name: Manage EKS Cluster
+name: Deploy Node.js App to EKS
 
 on:
   workflow_dispatch:
@@ -12,78 +12,128 @@ on:
         required: true
         default: 'us-east-1'
       action:
-        description: 'Action to perform (apply/destroy)'
+        description: 'Action to perform (deploy/remove)'
         required: true
-        default: 'apply'
+        default: 'deploy'
         type: choice
         options:
-          - apply
-          - destroy
+          - deploy
+          - remove
+  push:
+    branches: [ main ]
+    paths:
+      - 'app/**'
+      - 'kubernetes/**'
+      - 'Dockerfile'
 
 jobs:
-  apply_cluster:
+  build_and_push:
     runs-on: ubuntu-latest
-    if: ${{ github.event.inputs.action == 'apply' }}
+    if: ${{ github.event.inputs.action == 'deploy' || github.event_name == 'push' }}
+    outputs:
+      image_tag: ${{ steps.image-tag.outputs.tag }}
+    
     steps:
     - name: Checkout code
       uses: actions/checkout@v3
     
-    - name: Setup Terraform
-      uses: hashicorp/setup-terraform@v2
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v2
       with:
-        cli_config_credentials_token: ${{ secrets.TF_API_TOKEN }}
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ github.event.inputs.awsRegion || 'us-east-1' }}
     
-    - name: Create terraform.auto.tfvars
+    - name: Login to Amazon ECR
+      id: login-ecr
+      uses: aws-actions/amazon-ecr-login@v1
+    
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v2
+    
+    - name: Generate image tag
+      id: image-tag
       run: |
-        echo 'cluster_name = "${{ github.event.inputs.clusterName }}"' > terraform.auto.tfvars
-        echo 'region = "${{ github.event.inputs.awsRegion }}"' >> terraform.auto.tfvars
+        TAG=$(echo $GITHUB_SHA | cut -c1-7)
+        echo "tag=$TAG" >> $GITHUB_OUTPUT
     
-    - name: Terraform Init
-      run: terraform init -upgrade
-    
-    - name: Terraform Format
-      run: terraform fmt
-    
-    - name: Terraform Validate
-      run: terraform validate
-    
-    - name: Terraform Apply
-      run: terraform apply -auto-approve
+    - name: Build and push Docker image
+      uses: docker/build-push-action@v4
+      with:
+        context: .
+        push: true
+        tags: ${{ steps.login-ecr.outputs.registry }}/${{ github.event.repository.name }}:${{ steps.image-tag.outputs.tag }}, ${{ steps.login-ecr.outputs.registry }}/${{ github.event.repository.name }}:latest
 
-  destroy_cluster:
+  deploy_to_eks:
+    needs: build_and_push
     runs-on: ubuntu-latest
-    if: ${{ github.event.inputs.action == 'destroy' }}
+    if: ${{ github.event.inputs.action == 'deploy' || github.event_name == 'push' }}
+    
     steps:
     - name: Checkout code
       uses: actions/checkout@v3
     
-    - name: Setup Terraform
-      uses: hashicorp/setup-terraform@v2
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v2
       with:
-        cli_config_credentials_token: ${{ secrets.TF_API_TOKEN }}
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ github.event.inputs.awsRegion || 'us-east-1' }}
     
-    - name: Create terraform.auto.tfvars
+    - name: Login to Amazon ECR
+      id: login-ecr
+      uses: aws-actions/amazon-ecr-login@v1
+    
+    - name: Update kubeconfig
       run: |
-        echo 'cluster_name = "${{ github.event.inputs.clusterName }}"' > terraform.auto.tfvars
-        echo 'region = "${{ github.event.inputs.awsRegion }}"' >> terraform.auto.tfvars
-      working-directory: Terraform
+        aws eks update-kubeconfig --region ${{ github.event.inputs.awsRegion || 'us-east-1' }} --name ${{ github.event.inputs.clusterName || 'my_eks_cluster' }}
     
-    - name: Terraform Init
-      run: terraform init -upgrade
-      working-directory: Terraform
+    - name: Update Kubernetes manifests
+      run: |
+        # Replace placeholders in Kubernetes manifests
+        ECR_REPOSITORY_URI="${{ steps.login-ecr.outputs.registry }}/${{ github.event.repository.name }}"
+        IMAGE_TAG="${{ needs.build_and_push.outputs.image_tag }}"
+        
+        # Process Kubernetes YAML files
+        mkdir -p kubernetes/processed
+        for file in kubernetes/*.yaml; do
+          sed -e "s|\${ECR_REPOSITORY_URI}|$ECR_REPOSITORY_URI|g" \
+              -e "s|latest|$IMAGE_TAG|g" \
+              "$file" > "kubernetes/processed/$(basename "$file")"
+        done
     
-    - name: Terraform Format
-      run: terraform fmt
-      working-directory: Terraform
+    - name: Deploy to Kubernetes
+      run: |
+        kubectl apply -f kubernetes/processed/
     
-    - name: Terraform Validate
-      run: terraform validate
-      working-directory: Terraform
+    - name: Verify deployment
+      run: |
+        kubectl rollout status deployment/nodejs-app
     
-    - name: Terraform Destroy
-      run: terraform destroy -auto-approve
-      working-directory: Terraform
+    - name: Get Service URL
+      run: |
+        echo "Service URL:"
+        kubectl get service nodejs-app-service -o jsonpath="{.status.loadBalancer.ingress[0].hostname}"
 
-defaults:
-  run:
-    working-directory: Terraform
+  remove_from_eks:
+    runs-on: ubuntu-latest
+    if: ${{ github.event.inputs.action == 'remove' }}
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+    
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v2
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ github.event.inputs.awsRegion || 'us-east-1' }}
+    
+    - name: Update kubeconfig
+      run: |
+        aws eks update-kubeconfig --region ${{ github.event.inputs.awsRegion || 'us-east-1' }} --name ${{ github.event.inputs.clusterName || 'my_eks_cluster' }}
+    
+    - name: Remove from Kubernetes
+      run: |
+        kubectl delete -f kubernetes/ || true
