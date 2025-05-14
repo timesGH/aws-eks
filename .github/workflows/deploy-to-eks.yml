@@ -1,0 +1,71 @@
+name: Deploy Node.js App to EKS
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'src/**'
+      - 'public/**'
+      - 'Dockerfile'
+      - 'package.json'
+  workflow_dispatch:
+    inputs:
+      deployType:
+        description: "Deployment Type"
+        required: true
+        default: "update-app-only"
+        type: choice
+        options:
+          - update-app-only
+          - full-deploy
+
+jobs:
+  build_and_dispatch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+      
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v1
+      
+      - name: Create ECR Repository if it doesn't exist
+        run: |
+          REPO_NAME=$(echo "${{ github.repository }}" | awk -F/ '{print $2}')
+          aws ecr describe-repositories --repository-names $REPO_NAME || aws ecr create-repository --repository-name $REPO_NAME
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+      
+      - name: Build and push Docker image
+        id: docker-build
+        uses: docker/build-push-action@v4
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.login-ecr.outputs.registry }}/${{ github.repository }}:${{ github.sha }},${{ steps.login-ecr.outputs.registry }}/${{ github.repository }}:latest
+      
+      - name: Trigger EKS deployment workflow
+        uses: peter-evans/repository-dispatch@v2
+        with:
+          token: ${{ secrets.DISPATCH_TOKEN }}
+          repository: timesGH/aws-eks
+          event-type: deploy-app
+          client-payload: |
+            {
+              "app_name": "${{ secrets.APP_NAME }}",
+              "deploy_type": "${{ github.event.inputs.deployType || 'update-app-only' }}",
+              "image_uri": "${{ steps.login-ecr.outputs.registry }}/${{ github.repository }}:${{ github.sha }}",
+              "cluster_name": "${{ secrets.CLUSTER_NAME }}",
+              "aws_region": "${{ secrets.AWS_REGION }}",
+              "container_port": ${{ secrets.CONTAINER_PORT || 3000 }},
+              "repo_name": "${{ github.repository }}"
+            }
