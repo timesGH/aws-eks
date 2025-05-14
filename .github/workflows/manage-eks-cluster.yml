@@ -1,4 +1,4 @@
-name: Deploy Node.js App to EKS
+name: Manage EKS Cluster via Terraform Cloud
 
 on:
   workflow_dispatch:
@@ -12,128 +12,118 @@ on:
         required: true
         default: 'us-east-1'
       action:
-        description: 'Action to perform (deploy/remove)'
+        description: 'Infrastructure action (apply/destroy)'
         required: true
-        default: 'deploy'
+        default: 'apply'
         type: choice
         options:
-          - deploy
-          - remove
-  push:
-    branches: [ main ]
-    paths:
-      - 'app/**'
-      - 'kubernetes/**'
-      - 'Dockerfile'
+          - apply
+          - destroy
+
+env:
+  TF_WORKSPACE: "eks-demo"
+  TF_ORG: "Honours"
+  TF_API_TOKEN: ${{ secrets.TF_API_TOKEN }}
 
 jobs:
-  build_and_push:
+  terraform:
     runs-on: ubuntu-latest
-    if: ${{ github.event.inputs.action == 'deploy' || github.event_name == 'push' }}
     outputs:
-      image_tag: ${{ steps.image-tag.outputs.tag }}
+      cluster_name: ${{ steps.outputs.outputs.cluster_name }}
+      region: ${{ steps.outputs.outputs.region }}
+      ecr_repository_uri: ${{ steps.ecr.outputs.repository-uri }}
     
     steps:
     - name: Checkout code
       uses: actions/checkout@v3
-    
-    - name: Configure AWS credentials
-      uses: aws-actions/configure-aws-credentials@v2
-      with:
-        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-        aws-region: ${{ github.event.inputs.awsRegion || 'us-east-1' }}
-    
-    - name: Login to Amazon ECR
-      id: login-ecr
-      uses: aws-actions/amazon-ecr-login@v1
-    
-    - name: Set up Docker Buildx
-      uses: docker/setup-buildx-action@v2
-    
-    - name: Generate image tag
-      id: image-tag
+      
+    - name: Setup Terraform Cloud Configuration
       run: |
-        TAG=$(echo $GITHUB_SHA | cut -c1-7)
-        echo "tag=$TAG" >> $GITHUB_OUTPUT
+        mkdir -p ~/.terraform.d
+        cat > ~/.terraform.d/credentials.tfrc.json <<EOF
+        {
+          "credentials": {
+            "app.terraform.io": {
+              "token": "${{ env.TF_API_TOKEN }}"
+            }
+          }
+        }
+        EOF
     
-    - name: Build and push Docker image
-      uses: docker/build-push-action@v4
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v2
       with:
-        context: .
-        push: true
-        tags: ${{ steps.login-ecr.outputs.registry }}/${{ github.event.repository.name }}:${{ steps.image-tag.outputs.tag }}, ${{ steps.login-ecr.outputs.registry }}/${{ github.event.repository.name }}:latest
-
-  deploy_to_eks:
-    needs: build_and_push
-    runs-on: ubuntu-latest
-    if: ${{ github.event.inputs.action == 'deploy' || github.event_name == 'push' }}
+        terraform_wrapper: false
     
-    steps:
-    - name: Checkout code
-      uses: actions/checkout@v3
+    - name: Terraform Init
+      run: terraform init
     
-    - name: Configure AWS credentials
-      uses: aws-actions/configure-aws-credentials@v2
-      with:
-        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-        aws-region: ${{ github.event.inputs.awsRegion || 'us-east-1' }}
-    
-    - name: Login to Amazon ECR
-      id: login-ecr
-      uses: aws-actions/amazon-ecr-login@v1
-    
-    - name: Update kubeconfig
+    - name: Set Terraform Variables
       run: |
-        aws eks update-kubeconfig --region ${{ github.event.inputs.awsRegion || 'us-east-1' }} --name ${{ github.event.inputs.clusterName || 'my_eks_cluster' }}
+        # Create a variables file for this run
+        cat > terraform.auto.tfvars <<EOF
+        cluster_name = "${{ github.event.inputs.clusterName }}"
+        region = "${{ github.event.inputs.awsRegion }}"
+        EOF
     
-    - name: Update Kubernetes manifests
+    - name: Terraform Plan
+      run: terraform plan -out=tfplan
+    
+    - name: Terraform Apply/Destroy
       run: |
-        # Replace placeholders in Kubernetes manifests
-        ECR_REPOSITORY_URI="${{ steps.login-ecr.outputs.registry }}/${{ github.event.repository.name }}"
-        IMAGE_TAG="${{ needs.build_and_push.outputs.image_tag }}"
+        if [[ "${{ github.event.inputs.action }}" == "apply" ]]; then
+          terraform apply -auto-approve tfplan
+        else
+          terraform destroy -auto-approve
+        fi
+    
+    - name: Capture Outputs
+      id: outputs
+      if: ${{ github.event.inputs.action == 'apply' }}
+      run: |
+        echo "cluster_name=$(terraform output -raw cluster_name)" >> $GITHUB_OUTPUT
+        echo "region=$(terraform output -raw region)" >> $GITHUB_OUTPUT
+    
+    - name: Create ECR Repository
+      id: ecr
+      if: ${{ github.event.inputs.action == 'apply' }}
+      run: |
+        # Install AWS CLI
+        pip install awscli
         
-        # Process Kubernetes YAML files
-        mkdir -p kubernetes/processed
-        for file in kubernetes/*.yaml; do
-          sed -e "s|\${ECR_REPOSITORY_URI}|$ECR_REPOSITORY_URI|g" \
-              -e "s|latest|$IMAGE_TAG|g" \
-              "$file" > "kubernetes/processed/$(basename "$file")"
-        done
+        # Configure AWS using Terraform outputs
+        export AWS_REGION=${{ steps.outputs.outputs.region }}
+        export AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY_ID }}
+        export AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        
+        # Create ECR repository if it doesn't exist
+        REPO_NAME="${{ github.event.repository.name }}"
+        aws ecr describe-repositories --repository-names $REPO_NAME || \
+        aws ecr create-repository --repository-name $REPO_NAME
+        
+        # Get repository URI
+        REPO_URI=$(aws ecr describe-repositories --repository-names $REPO_NAME \
+          --query 'repositories[0].repositoryUri' --output text)
+        echo "repository-uri=$REPO_URI" >> $GITHUB_OUTPUT
     
-    - name: Deploy to Kubernetes
+    - name: Setup Post-deployment
+      if: ${{ github.event.inputs.action == 'apply' }}
+      env:
+        AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
       run: |
-        kubectl apply -f kubernetes/processed/
-    
-    - name: Verify deployment
+        chmod +x post-deploy.sh
+        ./post-deploy.sh
+        
+    - name: Configure kubectl
+      if: ${{ github.event.inputs.action == 'apply' }}
+      env:
+        AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
       run: |
-        kubectl rollout status deployment/nodejs-app
-    
-    - name: Get Service URL
-      run: |
-        echo "Service URL:"
-        kubectl get service nodejs-app-service -o jsonpath="{.status.loadBalancer.ingress[0].hostname}"
-
-  remove_from_eks:
-    runs-on: ubuntu-latest
-    if: ${{ github.event.inputs.action == 'remove' }}
-    
-    steps:
-    - name: Checkout code
-      uses: actions/checkout@v3
-    
-    - name: Configure AWS credentials
-      uses: aws-actions/configure-aws-credentials@v2
-      with:
-        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-        aws-region: ${{ github.event.inputs.awsRegion || 'us-east-1' }}
-    
-    - name: Update kubeconfig
-      run: |
-        aws eks update-kubeconfig --region ${{ github.event.inputs.awsRegion || 'us-east-1' }} --name ${{ github.event.inputs.clusterName || 'my_eks_cluster' }}
-    
-    - name: Remove from Kubernetes
-      run: |
-        kubectl delete -f kubernetes/ || true
+        # Update kubeconfig
+        aws eks update-kubeconfig --region ${{ steps.outputs.outputs.region }} \
+          --name ${{ steps.outputs.outputs.cluster_name }}
+        
+        # Test cluster connectivity
+        kubectl get nodes
