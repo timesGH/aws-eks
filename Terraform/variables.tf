@@ -45,3 +45,9 @@ variable "cluster_desired_size" {
   type        = number
   default     = 2
 }
+
+variable "app_name" {
+  description = "Name of the application to be deployed in EKS"
+  type        = string
+  default     = "nodejs-app"
+}
