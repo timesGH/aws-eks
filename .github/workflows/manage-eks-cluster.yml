@@ -20,16 +20,6 @@ on:
         options:
           - deploy
           - remove
-      appName:
-        description: 'Application name'
-        required: true
-      repoName:
-        description: 'Repository name'
-        required: true
-      containerPort:
-        description: 'Container port'
-        required: true
-        default: '3000'
 
 jobs:
   deploy-job:
@@ -78,120 +68,9 @@ jobs:
       - name: Simple post-deploy
         run: |
           echo "Kubeconfig updated successfully!"
-      
-      - name: Login to Amazon ECR
-        id: login-ecr
-        uses: aws-actions/amazon-ecr-login@v1
-      
-      - name: Create ECR repository
-        run: |
-          aws ecr describe-repositories --repository-names ${{ github.event.inputs.appName }} || \
-          aws ecr create-repository --repository-name ${{ github.event.inputs.appName }}
-      
-      - name: Checkout application code
-        uses: actions/checkout@v3
-        with:
-          repository: ${{ github.repository_owner }}/${{ github.event.inputs.repoName }}
-          ref: main
-          path: app-code
-          token: ${{ secrets.GITHUB_TOKEN }}
-        continue-on-error: true
-      
-      - name: Check if application code was checked out
-        id: check-app-code
-        run: |
-          if [ -d "app-code" ] && [ "$(ls -A app-code)" ]; then
-            echo "App code found, proceeding with build and deploy"
-            echo "app_code_exists=true" >> $GITHUB_OUTPUT
-          else
-            echo "App code not found or empty, creating minimal application"
-            mkdir -p app-code
-            cd app-code
-            
-            # Create minimal package.json
-            echo '{
-              "name": "${{ github.event.inputs.appName }}",
-              "version": "1.0.0",
-              "main": "app.js",
-              "scripts": {
-                "start": "node app.js"
-              },
-              "dependencies": {
-                "express": "^4.18.2"
-              }
-            }' > package.json
-            
-            # Create minimal app.js
-            echo 'const express = require("express");
-            const app = express();
-            const port = process.env.PORT || ${{ github.event.inputs.containerPort }};
-            
-            app.get("/", (req, res) => {
-              res.send(`
-                <h1>Welcome to ${{ github.event.inputs.appName }}!</h1>
-                <p>This is a default application.</p>
-                <p>Check <a href="/health">health endpoint</a> for status</p>
-              `);
-            });
-            
-            app.get("/health", (req, res) => {
-              res.status(200).json({
-                status: "ok",
-                version: process.version,
-                timestamp: new Date().toISOString(),
-                app: "${{ github.event.inputs.appName }}",
-                uptime: process.uptime()
-              });
-            });
-            
-            app.listen(port, () => {
-              console.log(`App listening at http://localhost:${port}`);
-            });' > app.js
-            
-            # Create Dockerfile
-            echo 'FROM node:18-alpine
-            WORKDIR /app
-            COPY package*.json ./
-            RUN npm install
-            COPY . .
-            ENV PORT=${{ github.event.inputs.containerPort }}
-            EXPOSE ${{ github.event.inputs.containerPort }}
-            CMD ["node", "app.js"]' > Dockerfile
-            
-            echo "app_code_exists=true" >> $GITHUB_OUTPUT
-          fi
-      
-      - name: Build and push Docker image
-        uses: docker/build-push-action@v4
-        with:
-          context: app-code
-          push: true
-          tags: ${{ steps.login-ecr.outputs.registry }}/${{ github.event.inputs.appName }}:latest
-        if: steps.check-app-code.outputs.app_code_exists == 'true'
-      
-      - name: Deploy application to Kubernetes
-        run: |
-          # Create deployment
-          kubectl create deployment ${{ github.event.inputs.appName }} \
-            --image=${{ steps.login-ecr.outputs.registry }}/${{ github.event.inputs.appName }}:latest \
-            --port=${{ github.event.inputs.containerPort }} || \
-          kubectl set image deployment/${{ github.event.inputs.appName }} \
-            ${{ github.event.inputs.appName }}=${{ steps.login-ecr.outputs.registry }}/${{ github.event.inputs.appName }}:latest
-          
-          # Create service
-          kubectl expose deployment ${{ github.event.inputs.appName }} \
-            --name=${{ github.event.inputs.appName }}-service \
-            --port=80 \
-            --target-port=${{ github.event.inputs.containerPort }} \
-            --type=LoadBalancer || \
-          echo "Service already exists"
-        if: steps.check-app-code.outputs.app_code_exists == 'true'
-      
-      - name: Get Service URL
-        run: |
-          echo "Service URL might take a few minutes to be available"
-          kubectl get service ${{ github.event.inputs.appName }}-service
-        if: steps.check-app-code.outputs.app_code_exists == 'true'
+          echo "EKS cluster ${{ github.event.inputs.clusterName }} has been created!"
+          echo "To connect to your cluster, run:"
+          echo "aws eks --region ${{ github.event.inputs.awsRegion }} update-kubeconfig --name ${{ github.event.inputs.clusterName }}"
 
   destroy-job:
     runs-on: ubuntu-latest
@@ -207,22 +86,14 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ github.event.inputs.awsRegion }}
       
-      - name: Try to connect to cluster and delete Kubernetes resources
+      - name: Try to connect to cluster and update status
         run: |
           # Try to connect to the cluster
           echo "Checking if cluster exists..."
           if aws eks describe-cluster --name ${{ github.event.inputs.clusterName }} --region ${{ github.event.inputs.awsRegion }} &> /dev/null; then
-            echo "Cluster exists, updating kubeconfig..."
-            aws eks --region ${{ github.event.inputs.awsRegion }} update-kubeconfig --name ${{ github.event.inputs.clusterName }}
-            
-            echo "Deleting Kubernetes resources..."
-            kubectl delete service ${{ github.event.inputs.appName }}-service --ignore-not-found=true
-            kubectl delete deployment ${{ github.event.inputs.appName }} --ignore-not-found=true
-            
-            echo "Waiting for resources to clean up..."
-            sleep 30
+            echo "Cluster exists, will proceed with destruction"
           else
-            echo "Cluster doesn't exist, skipping Kubernetes resource cleanup."
+            echo "Cluster doesn't exist, but will continue with Terraform destroy"
           fi
       
       - name: Setup Terraform
@@ -246,9 +117,12 @@ jobs:
         working-directory: Terraform
         run: terraform destroy -auto-approve || true
       
-      - name: Cleanup additional resources
+      - name: Cleanup verification
         run: |
-          # Try to delete ECR repository
-          echo "Attempting to delete ECR repository..."
-          aws ecr delete-repository --repository-name ${{ github.event.inputs.appName }} \
-            --force --region ${{ github.event.inputs.awsRegion }} || true
+          echo "Verifying deletion of EKS cluster..."
+          if aws eks describe-cluster --name ${{ github.event.inputs.clusterName }} --region ${{ github.event.inputs.awsRegion }} &> /dev/null; then
+            echo "Warning: Cluster still exists. It may still be in the process of being deleted."
+            echo "Check the AWS Management Console for status."
+          else
+            echo "Cluster ${{ github.event.inputs.clusterName }} has been successfully deleted!"
+          fi
