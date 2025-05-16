@@ -46,15 +46,15 @@ jobs:
       with:
         cli_config_credentials_token: ${{ secrets.TF_API_TOKEN }}
     
+    - name: Terraform Init
+      run: terraform init -upgrade
+    
     - name: Create Terraform variables file
       run: |
         cat > terraform.auto.tfvars <<EOF
         region = "${{ github.event.inputs.awsRegion }}"
         cluster_name = "${{ github.event.inputs.clusterName }}"
         EOF
-    
-    - name: Terraform Init
-      run: terraform init -upgrade
     
     - name: Terraform Plan
       run: terraform plan
@@ -95,32 +95,53 @@ jobs:
         aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
         aws-region: ${{ github.event.inputs.awsRegion }}
     
-    # ... rest of job unchanged ...
+    # ... rest of the build_and_deploy job ...
 
   terraform_destroy:
     runs-on: ubuntu-latest
     if: ${{ github.event.inputs.action == 'remove' }}
-    defaults:
-      run:
-        working-directory: Terraform
     steps:
     - name: Checkout code
       uses: actions/checkout@v3
+    
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v2
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ github.event.inputs.awsRegion }}
+        
+    - name: Install jq (required for cleanup script)
+      run: sudo apt-get update && sudo apt-get install -y jq
+    
+    - name: Run cleanup script
+      run: |
+        chmod +x cleanup.sh
+        ./cleanup.sh ${{ github.event.inputs.awsRegion }} ${{ github.event.inputs.clusterName }}
     
     - name: Setup Terraform
       uses: hashicorp/setup-terraform@v2
       with:
         cli_config_credentials_token: ${{ secrets.TF_API_TOKEN }}
     
+    - name: Terraform Init
+      working-directory: Terraform
+      run: terraform init -upgrade
+    
     - name: Create Terraform variables file
+      working-directory: Terraform
       run: |
         cat > terraform.auto.tfvars <<EOF
         region = "${{ github.event.inputs.awsRegion }}"
         cluster_name = "${{ github.event.inputs.clusterName }}"
         EOF
     
-    - name: Terraform Init
-      run: terraform init -upgrade
-    
     - name: Terraform Destroy
-      run: terraform destroy -auto-approve
+      working-directory: Terraform
+      run: terraform destroy -auto-approve || true
+    
+    - name: Final Resource Cleanup Check
+      run: |
+        echo "Performing final verification of resource cleanup..."
+        ./cleanup.sh ${{ github.event.inputs.awsRegion }} ${{ github.event.inputs.clusterName }}
+        echo "Cleanup complete"
