@@ -36,7 +36,7 @@ jobs:
     if: ${{ github.event.inputs.action == 'deploy' }}
     defaults:
       run:
-        working-directory: Terraform  # Change terraform to Terraform
+        working-directory: Terraform
     steps:
     - name: Checkout code
       uses: actions/checkout@v3
@@ -47,7 +47,7 @@ jobs:
         cli_config_credentials_token: ${{ secrets.TF_API_TOKEN }}
     
     - name: Terraform Init
-      run: terraform init
+      run: terraform init -upgrade  # Added -upgrade flag
     
     - name: Terraform Plan
       run: |
@@ -61,139 +61,14 @@ jobs:
           -var="region=${{ github.event.inputs.awsRegion }}" \
           -var="cluster_name=${{ github.event.inputs.clusterName }}"
     
-    # For the post-Terraform steps we still need AWS credentials to interact with EKS
-    - name: Configure AWS credentials
-      uses: aws-actions/configure-aws-credentials@v2
-      with:
-        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-        aws-region: ${{ github.event.inputs.awsRegion }}
-        
-    - name: Wait for Cluster to be Ready
-      run: |
-        echo "Waiting for EKS cluster to be ready..."
-        aws eks wait cluster-active --name ${{ github.event.inputs.clusterName }} --region ${{ github.event.inputs.awsRegion }}
-        
-    - name: Update kubeconfig
-      run: |
-        aws eks --region ${{ github.event.inputs.awsRegion }} update-kubeconfig \
-          --name ${{ github.event.inputs.clusterName }}
-    
-    - name: Run post-deploy script
-      run: bash post-deploy.sh
-
-  # Rest of your workflow remains the same...
-  build_and_deploy:
-    needs: terraform
-    runs-on: ubuntu-latest
-    if: ${{ github.event.inputs.action == 'deploy' }}
-    steps:
-    - name: Configure AWS credentials
-      uses: aws-actions/configure-aws-credentials@v2
-      with:
-        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-        aws-region: ${{ github.event.inputs.awsRegion }}
-    
-    - name: Login to Amazon ECR
-      id: login-ecr
-      uses: aws-actions/amazon-ecr-login@v1
-    
-    - name: Create ECR repository if it doesn't exist
-      run: |
-        aws ecr describe-repositories --repository-names ${{ github.event.inputs.appName }} || \
-        aws ecr create-repository --repository-name ${{ github.event.inputs.appName }}
-    
-    - name: Checkout application code
-      uses: actions/checkout@v3
-      with:
-        repository: ${{ github.repository_owner }}/${{ github.event.inputs.repoName }}
-        ref: main
-    
-    - name: Build and push Docker image
-      uses: docker/build-push-action@v4
-      with:
-        context: .
-        push: true
-        tags: ${{ steps.login-ecr.outputs.registry }}/${{ github.event.inputs.appName }}:latest
-    
-    - name: Update kubeconfig
-      run: |
-        aws eks --region ${{ github.event.inputs.awsRegion }} update-kubeconfig \
-          --name ${{ github.event.inputs.clusterName }}
-    
-    - name: Deploy to Kubernetes
-      run: |
-        # Create or update deployment
-        cat <<EOF | kubectl apply -f -
-        apiVersion: apps/v1
-        kind: Deployment
-        metadata:
-          name: ${{ github.event.inputs.appName }}
-          namespace: default
-        spec:
-          replicas: 2
-          selector:
-            matchLabels:
-              app: ${{ github.event.inputs.appName }}
-          template:
-            metadata:
-              labels:
-                app: ${{ github.event.inputs.appName }}
-            spec:
-              containers:
-              - name: ${{ github.event.inputs.appName }}
-                image: ${{ steps.login-ecr.outputs.registry }}/${{ github.event.inputs.appName }}:latest
-                ports:
-                - containerPort: ${{ github.event.inputs.containerPort }}
-                env:
-                - name: NODE_ENV
-                  value: "production"
-                - name: PORT
-                  value: "${{ github.event.inputs.containerPort }}"
-                livenessProbe:
-                  httpGet:
-                    path: /health
-                    port: ${{ github.event.inputs.containerPort }}
-                  initialDelaySeconds: 30
-                  periodSeconds: 10
-                readinessProbe:
-                  httpGet:
-                    path: /health
-                    port: ${{ github.event.inputs.containerPort }}
-                  initialDelaySeconds: 5
-                  periodSeconds: 5
-        EOF
-        
-        # Create or update service
-        cat <<EOF | kubectl apply -f -
-        apiVersion: v1
-        kind: Service
-        metadata:
-          name: ${{ github.event.inputs.appName }}-service
-          namespace: default
-        spec:
-          selector:
-            app: ${{ github.event.inputs.appName }}
-          ports:
-          - port: 80
-            targetPort: ${{ github.event.inputs.containerPort }}
-          type: LoadBalancer
-        EOF
-    
-    - name: Get Service URL
-      run: |
-        echo "Waiting for service to get external IP..."
-        kubectl wait --for=jsonpath='{.status.loadBalancer.ingress[0].hostname}' service/${{ github.event.inputs.appName }}-service --timeout=300s
-        echo "Service URL:"
-        kubectl get service ${{ github.event.inputs.appName }}-service -o jsonpath="{.status.loadBalancer.ingress[0].hostname}"
+    # ...rest of job...
 
   terraform_destroy:
     runs-on: ubuntu-latest
     if: ${{ github.event.inputs.action == 'remove' }}
     defaults:
       run:
-        working-directory: Terraform  # Change terraform to Terraform
+        working-directory: Terraform
     steps:
     - name: Checkout code
       uses: actions/checkout@v3
@@ -204,7 +79,7 @@ jobs:
         cli_config_credentials_token: ${{ secrets.TF_API_TOKEN }}
     
     - name: Terraform Init
-      run: terraform init
+      run: terraform init -upgrade  # Added -upgrade flag
     
     - name: Terraform Destroy
       run: |
