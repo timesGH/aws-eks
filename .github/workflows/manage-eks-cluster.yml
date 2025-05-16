@@ -61,7 +61,7 @@ jobs:
       
       - name: Terraform Init
         working-directory: Terraform
-        run: terraform init
+        run: terraform init -upgrade
       
       - name: Terraform Apply
         working-directory: Terraform
@@ -141,15 +141,20 @@ jobs:
       - name: Try to connect to cluster and delete Kubernetes resources
         run: |
           # Try to connect to the cluster
-          aws eks --region ${{ github.event.inputs.awsRegion }} update-kubeconfig \
-            --name ${{ github.event.inputs.clusterName }} || true
-          
-          # Try to delete Kubernetes resources
-          kubectl delete service ${{ github.event.inputs.appName }}-service || true
-          kubectl delete deployment ${{ github.event.inputs.appName }} || true
-          
-          # Wait for resources to clean up
-          sleep 30
+          echo "Checking if cluster exists..."
+          if aws eks describe-cluster --name ${{ github.event.inputs.clusterName }} --region ${{ github.event.inputs.awsRegion }} &> /dev/null; then
+            echo "Cluster exists, updating kubeconfig..."
+            aws eks --region ${{ github.event.inputs.awsRegion }} update-kubeconfig --name ${{ github.event.inputs.clusterName }}
+            
+            echo "Deleting Kubernetes resources..."
+            kubectl delete service ${{ github.event.inputs.appName }}-service --ignore-not-found=true
+            kubectl delete deployment ${{ github.event.inputs.appName }} --ignore-not-found=true
+            
+            echo "Waiting for resources to clean up..."
+            sleep 30
+          else
+            echo "Cluster doesn't exist, skipping Kubernetes resource cleanup."
+          fi
       
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v2
@@ -166,7 +171,7 @@ jobs:
       
       - name: Terraform Init
         working-directory: Terraform
-        run: terraform init
+        run: terraform init -upgrade
       
       - name: Terraform Destroy
         working-directory: Terraform
