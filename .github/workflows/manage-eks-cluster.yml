@@ -1,4 +1,4 @@
-name: Deploy Node.js App to EKS
+name: Deploy/Remove EKS Infrastructure
 
 on:
   workflow_dispatch:
@@ -31,77 +31,76 @@ on:
         default: '3000'
 
 jobs:
-  terraform:
+  deploy:
     runs-on: ubuntu-latest
     if: ${{ github.event.inputs.action == 'deploy' }}
-    defaults:
-      run:
-        working-directory: Terraform
     steps:
     - name: Checkout code
       uses: actions/checkout@v3
+    
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v2
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ github.event.inputs.awsRegion }}
     
     - name: Setup Terraform
       uses: hashicorp/setup-terraform@v2
       with:
         cli_config_credentials_token: ${{ secrets.TF_API_TOKEN }}
     
-    - name: Terraform Init
-      run: terraform init -upgrade
-    
     - name: Create Terraform variables file
+      working-directory: Terraform
       run: |
         cat > terraform.auto.tfvars <<EOF
         region = "${{ github.event.inputs.awsRegion }}"
         cluster_name = "${{ github.event.inputs.clusterName }}"
         EOF
     
-    - name: Terraform Plan
-      run: terraform plan
+    - name: Terraform Init
+      working-directory: Terraform
+      run: terraform init
     
     - name: Terraform Apply
+      working-directory: Terraform
       run: terraform apply -auto-approve
     
-    # For the post-Terraform steps we still need AWS credentials to interact with EKS
-    - name: Configure AWS credentials
-      uses: aws-actions/configure-aws-credentials@v2
-      with:
-        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-        aws-region: ${{ github.event.inputs.awsRegion }}
-        
-    - name: Wait for Cluster to be Ready
-      run: |
-        echo "Waiting for EKS cluster to be ready..."
-        aws eks wait cluster-active --name ${{ github.event.inputs.clusterName }} --region ${{ github.event.inputs.awsRegion }}
-        
     - name: Update kubeconfig
       run: |
         aws eks --region ${{ github.event.inputs.awsRegion }} update-kubeconfig \
           --name ${{ github.event.inputs.clusterName }}
     
-    - name: Run post-deploy script
+    - name: Wait for cluster to be ready
       run: |
-        cd ..
-        bash post-deploy.sh
+        echo "Waiting for EKS cluster to be ready..."
+        sleep 60
+    
+    - name: Create simple post-deploy script
+      run: |
+        cat > simple-post-deploy.sh << 'EOF'
+#!/bin/bash
+set -e
 
-  build_and_deploy:
-    needs: terraform
-    runs-on: ubuntu-latest
-    if: ${{ github.event.inputs.action == 'deploy' }}
-    steps:
-    - name: Configure AWS credentials
-      uses: aws-actions/configure-aws-credentials@v2
-      with:
-        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-        aws-region: ${{ github.event.inputs.awsRegion }}
+REGION="$1"
+CLUSTER_NAME="$2"
+
+# Update kubeconfig
+echo "Updating kubeconfig..."
+aws eks --region ${REGION} update-kubeconfig --name ${CLUSTER_NAME}
+
+echo "Kubeconfig updated successfully!"
+EOF
+        chmod +x simple-post-deploy.sh
+    
+    - name: Run simplified post-deploy script
+      run: ./simple-post-deploy.sh ${{ github.event.inputs.awsRegion }} ${{ github.event.inputs.clusterName }}
     
     - name: Login to Amazon ECR
       id: login-ecr
       uses: aws-actions/amazon-ecr-login@v1
     
-    - name: Create ECR repository if it doesn't exist
+    - name: Create ECR repository
       run: |
         aws ecr describe-repositories --repository-names ${{ github.event.inputs.appName }} || \
         aws ecr create-repository --repository-name ${{ github.event.inputs.appName }}
@@ -118,11 +117,6 @@ jobs:
         context: .
         push: true
         tags: ${{ steps.login-ecr.outputs.registry }}/${{ github.event.inputs.appName }}:latest
-    
-    - name: Update kubeconfig
-      run: |
-        aws eks --region ${{ github.event.inputs.awsRegion }} update-kubeconfig \
-          --name ${{ github.event.inputs.clusterName }}
     
     - name: Deploy to Kubernetes
       run: |
@@ -155,13 +149,6 @@ jobs:
                   value: "${{ github.event.inputs.containerPort }}"
                 - name: APP_NAME
                   value: "${{ github.event.inputs.appName }}"
-                resources:
-                  limits:
-                    cpu: "0.5"
-                    memory: "512Mi"
-                  requests:
-                    cpu: "0.1"
-                    memory: "256Mi"
                 livenessProbe:
                   httpGet:
                     path: /health
@@ -194,12 +181,10 @@ jobs:
     
     - name: Get Service URL
       run: |
-        echo "Waiting for service to get external IP..."
-        kubectl wait --for=jsonpath='{.status.loadBalancer.ingress[0].hostname}' service/${{ github.event.inputs.appName }}-service --timeout=300s || true
-        echo "Service URL:"
-        kubectl get service ${{ github.event.inputs.appName }}-service -o jsonpath="{.status.loadBalancer.ingress[0].hostname}" || echo "Service URL not available yet. It may take a few minutes."
+        echo "Service URL might take a few minutes to be available"
+        kubectl get service ${{ github.event.inputs.appName }}-service
 
-  terraform_destroy:
+  destroy:
     runs-on: ubuntu-latest
     if: ${{ github.event.inputs.action == 'remove' }}
     steps:
@@ -213,203 +198,19 @@ jobs:
         aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
         aws-region: ${{ github.event.inputs.awsRegion }}
     
-    - name: Install jq
-      run: sudo apt-get update && sudo apt-get install -y jq
-    
-    - name: Create cleanup script
+    - name: Install AWS CLI if needed
       run: |
-        cat > cleanup.sh << 'EOF'
-#!/bin/bash
-set -e
-
-REGION="$1"
-CLUSTER_NAME="$2"
-
-echo "Starting cleanup for region $REGION and cluster $CLUSTER_NAME"
-
-# Check if the cluster exists
-if ! aws eks describe-cluster --name $CLUSTER_NAME --region $REGION &>/dev/null; then
-  echo "Cluster $CLUSTER_NAME does not exist in region $REGION. Skipping EKS cleanup."
-else
-  # 1. Delete any EKS managed nodegroups
-  echo "Checking for EKS nodegroups..."
-  NODEGROUPS=$(aws eks list-nodegroups --cluster-name $CLUSTER_NAME --region $REGION --query 'nodegroups[*]' --output text 2>/dev/null || echo "")
-  if [ ! -z "$NODEGROUPS" ]; then
-    echo "Found nodegroups: $NODEGROUPS"
-    for NG in $NODEGROUPS; do
-      echo "Deleting nodegroup $NG..."
-      aws eks delete-nodegroup --cluster-name $CLUSTER_NAME --nodegroup-name $NG --region $REGION
-      echo "Waiting for nodegroup $NG to delete..."
-      aws eks wait nodegroup-deleted --cluster-name $CLUSTER_NAME --nodegroup-name $NG --region $REGION
-    done
-  fi
-
-  # 2. Delete any EKS fargate profiles
-  echo "Checking for EKS fargate profiles..."
-  FARGATE_PROFILES=$(aws eks list-fargate-profiles --cluster-name $CLUSTER_NAME --region $REGION --query 'fargateProfileNames[*]' --output text 2>/dev/null || echo "")
-  if [ ! -z "$FARGATE_PROFILES" ]; then
-    echo "Found fargate profiles: $FARGATE_PROFILES"
-    for FP in $FARGATE_PROFILES; do
-      echo "Deleting fargate profile $FP..."
-      aws eks delete-fargate-profile --cluster-name $CLUSTER_NAME --fargate-profile-name $FP --region $REGION
-      echo "Waiting for fargate profile $FP to delete..."
-      aws eks wait fargate-profile-deleted --cluster-name $CLUSTER_NAME --fargate-profile-name $FP --region $REGION
-    done
-  fi
-
-  # 3. Find and delete any load balancers associated with the cluster
-  echo "Checking for Load Balancers associated with EKS..."
-  # Get cluster tag to identify resources
-  CLUSTER_TAG="kubernetes.io/cluster/$CLUSTER_NAME"
-  
-  # Find load balancers that might be created by Kubernetes
-  LB_ARNS=$(aws elbv2 describe-load-balancers --query "LoadBalancers[].LoadBalancerArn" --output text --region $REGION)
-  
-  if [ ! -z "$LB_ARNS" ]; then
-    for LB in $LB_ARNS; do
-      # Check if this LB is associated with our cluster
-      LB_TAGS=$(aws elbv2 describe-tags --resource-arns $LB --region $REGION --query "TagDescriptions[0].Tags[?Key=='$CLUSTER_TAG']" --output text)
-      
-      if [ ! -z "$LB_TAGS" ]; then
-        echo "Deleting EKS-associated Load Balancer $LB..."
-        aws elbv2 delete-load-balancer --load-balancer-arn $LB --region $REGION
-      fi
-    done
-    
-    echo "Waiting for Load Balancers to delete (30 seconds)..."
-    sleep 30
-  fi
-
-  # 4. Delete the EKS cluster
-  echo "Deleting EKS cluster $CLUSTER_NAME..."
-  aws eks delete-cluster --name $CLUSTER_NAME --region $REGION
-  echo "Waiting for EKS cluster $CLUSTER_NAME to delete..."
-  aws eks wait cluster-deleted --name $CLUSTER_NAME --region $REGION
-
-  # Wait for AWS resources to clean up
-  echo "Waiting 2 minutes for AWS to clean up EKS resources..."
-  sleep 120
-fi
-
-# Find VPC associated with the cluster (by tag)
-echo "Finding VPC associated with the cluster..."
-VPC_ID=$(aws ec2 describe-vpcs --filters "Name=tag:kubernetes.io/cluster/${CLUSTER_NAME},Values=owned" --query "Vpcs[0].VpcId" --output text --region $REGION)
-
-# If no VPC found by tag, try by name
-if [ -z "$VPC_ID" ] || [ "$VPC_ID" == "None" ]; then
-  echo "No VPC found by cluster tag. Trying by name..."
-  VPC_ID=$(aws ec2 describe-vpcs --filters "Name=tag:Name,Values=*${CLUSTER_NAME}*" --query "Vpcs[0].VpcId" --output text --region $REGION)
-fi
-
-if [ -z "$VPC_ID" ] || [ "$VPC_ID" == "None" ]; then
-  echo "No VPC found for cluster $CLUSTER_NAME. Skipping VPC cleanup."
-  exit 0
-fi
-
-echo "Found VPC: $VPC_ID"
-
-# 5. Find and delete any NAT gateways in the VPC
-echo "Checking for NAT Gateways..."
-NAT_GATEWAY_IDS=$(aws ec2 describe-nat-gateways --filter "Name=vpc-id,Values=$VPC_ID" --query 'NatGateways[?State!=`deleted`].NatGatewayId' --output text --region $REGION)
-
-if [ ! -z "$NAT_GATEWAY_IDS" ]; then
-  echo "Found NAT Gateways: $NAT_GATEWAY_IDS"
-  for NGW in $NAT_GATEWAY_IDS; do
-    echo "Deleting NAT Gateway $NGW..."
-    aws ec2 delete-nat-gateway --nat-gateway-id $NGW --region $REGION
-  done
-  
-  echo "Waiting for NAT Gateways to delete (60 seconds)..."
-  sleep 60
-fi
-
-# 6. Find and delete any route tables that use the internet gateway
-echo "Finding Internet Gateway..."
-IGW_ID=$(aws ec2 describe-internet-gateways --filters "Name=attachment.vpc-id,Values=$VPC_ID" --query "InternetGateways[0].InternetGatewayId" --output text --region $REGION)
-
-if [ "$IGW_ID" != "None" ] && [ ! -z "$IGW_ID" ]; then
-  echo "Found Internet Gateway: $IGW_ID"
-  
-  echo "Updating route tables..."
-  ROUTE_TABLE_IDS=$(aws ec2 describe-route-tables --filters "Name=vpc-id,Values=$VPC_ID" --query 'RouteTables[].RouteTableId' --output text --region $REGION)
-  
-  if [ ! -z "$ROUTE_TABLE_IDS" ]; then
-    for RT in $ROUTE_TABLE_IDS; do
-      echo "Checking routes in route table $RT..."
-      # Check if this route table has a route to the internet gateway
-      ROUTES=$(aws ec2 describe-route-tables --route-table-ids $RT --query "RouteTables[0].Routes[?GatewayId=='$IGW_ID']" --output text --region $REGION)
-      
-      if [ ! -z "$ROUTES" ]; then
-        echo "Deleting routes to Internet Gateway in $RT..."
-        aws ec2 delete-route --route-table-id $RT --destination-cidr-block 0.0.0.0/0 --region $REGION || true
-      fi
-    done
-  fi
-  
-  # Detach and delete the internet gateway
-  echo "Detaching Internet Gateway $IGW_ID from VPC $VPC_ID..."
-  aws ec2 detach-internet-gateway --internet-gateway-id $IGW_ID --vpc-id $VPC_ID --region $REGION || true
-  
-  echo "Deleting Internet Gateway $IGW_ID..."
-  aws ec2 delete-internet-gateway --internet-gateway-id $IGW_ID --region $REGION || true
-fi
-
-# Wait to ensure all dependencies are deleted
-echo "Waiting 30 seconds for resources to clean up..."
-sleep 30
-
-# 7. Delete all the subnets
-echo "Deleting subnets..."
-SUBNET_IDS=$(aws ec2 describe-subnets --filters "Name=vpc-id,Values=$VPC_ID" --query "Subnets[].SubnetId" --output text --region $REGION)
-
-if [ ! -z "$SUBNET_IDS" ]; then
-  for SUBNET_ID in $SUBNET_IDS; do
-    echo "Deleting subnet $SUBNET_ID..."
-    aws ec2 delete-subnet --subnet-id $SUBNET_ID --region $REGION || true
-  done
-fi
-
-# 8. Delete VPC endpoints
-echo "Deleting VPC endpoints..."
-VPC_ENDPOINT_IDS=$(aws ec2 describe-vpc-endpoints --filters "Name=vpc-id,Values=$VPC_ID" --query "VpcEndpoints[].VpcEndpointId" --output text --region $REGION)
-
-if [ ! -z "$VPC_ENDPOINT_IDS" ]; then
-  echo "Deleting VPC endpoints: $VPC_ENDPOINT_IDS"
-  aws ec2 delete-vpc-endpoints --vpc-endpoint-ids $VPC_ENDPOINT_IDS --region $REGION || true
-  echo "Waiting 30 seconds for VPC endpoints to delete..."
-  sleep 30
-fi
-
-# 9. Delete security groups
-echo "Deleting security groups..."
-SEC_GROUPS=$(aws ec2 describe-security-groups --filters "Name=vpc-id,Values=$VPC_ID" --query "SecurityGroups[?GroupName!='default'].GroupId" --output text --region $REGION)
-
-if [ ! -z "$SEC_GROUPS" ]; then
-  for SG in $SEC_GROUPS; do
-    echo "Deleting security group $SG..."
-    aws ec2 delete-security-group --group-id $SG --region $REGION || true
-  done
-fi
-
-# 10. Finally, delete the VPC
-echo "Deleting VPC $VPC_ID..."
-aws ec2 delete-vpc --vpc-id $VPC_ID --region $REGION || true
-
-echo "Cleanup completed."
-EOF
-        chmod +x cleanup.sh
-    
-    - name: Initial cleanup
-      run: ./cleanup.sh ${{ github.event.inputs.awsRegion }} ${{ github.event.inputs.clusterName }}
+        if ! command -v aws &> /dev/null; then
+          curl "https://d1vvhvl2y92vcy.cloudfront.net/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+          unzip awscliv2.zip
+          sudo ./aws/install
+        fi
+        aws --version
     
     - name: Setup Terraform
       uses: hashicorp/setup-terraform@v2
       with:
         cli_config_credentials_token: ${{ secrets.TF_API_TOKEN }}
-    
-    - name: Terraform Init
-      working-directory: Terraform
-      run: terraform init -upgrade
     
     - name: Create Terraform variables file
       working-directory: Terraform
@@ -419,21 +220,37 @@ EOF
         cluster_name = "${{ github.event.inputs.clusterName }}"
         EOF
     
+    - name: Delete Kubernetes resources first
+      run: |
+        # Try to connect to the cluster
+        aws eks --region ${{ github.event.inputs.awsRegion }} update-kubeconfig --name ${{ github.event.inputs.clusterName }} || true
+        
+        # Try to delete services and deployments (ignore errors)
+        kubectl delete service ${{ github.event.inputs.appName }}-service || true
+        kubectl delete deployment ${{ github.event.inputs.appName }} || true
+        
+        # Wait a bit for resources to clean up
+        sleep 30
+    
+    - name: Terraform Init
+      working-directory: Terraform
+      run: terraform init
+    
     - name: Terraform Destroy
       working-directory: Terraform
       run: terraform destroy -auto-approve || true
     
-    - name: Final cleanup
-      run: ./cleanup.sh ${{ github.event.inputs.awsRegion }} ${{ github.event.inputs.clusterName }}
-    
-    - name: Verify no resources left
+    - name: Manual cleanup for EKS
+      if: always()  # Run even if Terraform destroy failed
       run: |
-        echo "Verifying cleanup..."
-        # Check if VPC still exists
-        VPC_ID=$(aws ec2 describe-vpcs --filters "Name=tag:Name,Values=*${{ github.event.inputs.clusterName }}*" --query "Vpcs[0].VpcId" --output text --region ${{ github.event.inputs.awsRegion }})
-        if [ "$VPC_ID" != "None" ] && [ ! -z "$VPC_ID" ]; then
-          echo "VPC $VPC_ID still exists. Running additional cleanup..."
-          ./cleanup.sh ${{ github.event.inputs.awsRegion }} ${{ github.event.inputs.clusterName }}
-        else
-          echo "Cleanup verified. No VPC resources remaining."
-        fi
+        # Try to delete the cluster directly with AWS CLI
+        echo "Attempting to delete EKS cluster directly..."
+        aws eks delete-cluster --name ${{ github.event.inputs.clusterName }} --region ${{ github.event.inputs.awsRegion }} || true
+        
+        # Wait for cluster to be deleted
+        echo "Waiting for cluster deletion (this might take a while)..."
+        sleep 60
+        
+        # Try to find and delete ECR repository
+        echo "Attempting to delete ECR repository..."
+        aws ecr delete-repository --repository-name ${{ github.event.inputs.appName }} --force --region ${{ github.event.inputs.awsRegion }} || true
