@@ -1,4 +1,4 @@
-name: Manage EKS Cluster and Deploy Applications
+name: Deploy Node.js App to EKS
 
 on:
   workflow_dispatch:
@@ -12,40 +12,35 @@ on:
         required: true
         default: 'us-east-1'
       action:
-        description: 'Action to perform'
+        description: 'Action to perform (deploy/remove)'
         required: true
-        default: 'apply'
+        default: 'deploy'
         type: choice
         options:
-          - apply
-          - update-app-only
-          - destroy
+          - deploy
+          - remove
       appName:
-        description: 'Application name (for Kubernetes resources)'
-        required: false
-        default: ''
+        description: 'Name of the application to deploy'
+        required: true
       repoName:
-        description: 'Repository name (for ECR)'
-        required: false
-        default: ''
+        description: 'Name of the repository containing the application'
+        required: true
       containerPort:
-        description: 'Container port'
-        required: false
+        description: 'Container port for the application'
+        required: true
         default: '3000'
-  
-  repository_dispatch:
-    types: [deploy-app]
 
 jobs:
-  terraform_provision:
-    name: 'Provision EKS with Terraform Cloud'
+  terraform:
     runs-on: ubuntu-latest
-    if: ${{ github.event.inputs.action != 'update-app-only' && (!github.event.client_payload || github.event.client_payload.deploy_type != 'update-app-only') }}
-    
+    if: ${{ github.event.inputs.action == 'deploy' }}
+    defaults:
+      run:
+        working-directory: terraform
     steps:
     - name: Checkout code
       uses: actions/checkout@v3
-
+    
     - name: Setup Terraform
       uses: hashicorp/setup-terraform@v2
       with:
@@ -53,195 +48,165 @@ jobs:
     
     - name: Terraform Init
       run: terraform init
-
-    - name: Terraform Validate
-      run: terraform validate
-
-    - name: Create terraform.tfvars
-      run: |
-        # Get cluster name and region from inputs or payload
-        CLUSTER_NAME="${{ github.event.inputs.clusterName || github.event.client_payload.cluster_name }}"
-        AWS_REGION="${{ github.event.inputs.awsRegion || github.event.client_payload.aws_region }}"
-        
-        cat > terraform.tfvars << EOF
-        region = "${AWS_REGION}"
-        cluster_name = "${CLUSTER_NAME}"
-        EOF
-
+    
     - name: Terraform Plan
-      if: ${{ github.event.inputs.action == 'apply' || github.event.client_payload.deploy_type == 'full-deploy' }}
-      run: terraform plan -var-file="terraform.tfvars" -input=false -out=tfplan
+      run: |
+        terraform plan \
+          -var="region=${{ github.event.inputs.awsRegion }}" \
+          -var="cluster_name=${{ github.event.inputs.clusterName }}"
 
     - name: Terraform Apply
-      if: ${{ github.event.inputs.action == 'apply' || github.event.client_payload.deploy_type == 'full-deploy' }}
-      run: terraform apply -auto-approve tfplan
-      
-    - name: Terraform Destroy
-      if: ${{ github.event.inputs.action == 'destroy' }}
-      run: terraform destroy -var-file="terraform.tfvars" -auto-approve
-
-    - name: Post-deployment configuration
-      if: ${{ github.event.inputs.action == 'apply' || github.event.client_payload.deploy_type == 'full-deploy' }}
       run: |
-        chmod +x ./post-deploy.sh
-        ./post-deploy.sh
-
-    - name: Export cluster info for next job
-      if: ${{ github.event.inputs.action == 'apply' || github.event.client_payload.deploy_type == 'full-deploy' }}
-      run: |
-        echo "CLUSTER_NAME=$(terraform output -raw cluster_name)" >> $GITHUB_ENV
-        echo "CLUSTER_REGION=$(terraform output -raw region)" >> $GITHUB_ENV
-
-  deploy_application:
-    name: 'Deploy Application to EKS'
-    runs-on: ubuntu-latest
-    needs: [terraform_provision]
-    if: |
-      always() && 
-      (needs.terraform_provision.result == 'success' || 
-       needs.terraform_provision.result == 'skipped' || 
-       github.event.inputs.action == 'update-app-only' || 
-       github.event.client_payload.deploy_type == 'update-app-only')
+        terraform apply -auto-approve \
+          -var="region=${{ github.event.inputs.awsRegion }}" \
+          -var="cluster_name=${{ github.event.inputs.clusterName }}"
     
-    steps:
-    - name: Checkout code
-      uses: actions/checkout@v3
-    
+    # For the post-Terraform steps we still need AWS credentials to interact with EKS
     - name: Configure AWS credentials
       uses: aws-actions/configure-aws-credentials@v2
       with:
         aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
         aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-        aws-region: ${{ github.event.inputs.awsRegion || github.event.client_payload.aws_region || env.CLUSTER_REGION }}
-    
-    - name: Set application variables
-      id: app-vars
-      run: |
-        # Set app name from inputs or payload
-        APP_NAME="${{ github.event.inputs.appName || github.event.client_payload.app_name }}"
-        REPO_NAME="${{ github.event.inputs.repoName || github.event.client_payload.repo_name }}"
-        CONTAINER_PORT="${{ github.event.inputs.containerPort || github.event.client_payload.container_port || 3000 }}"
-        CLUSTER_NAME="${{ github.event.inputs.clusterName || github.event.client_payload.cluster_name || env.CLUSTER_NAME }}"
-        AWS_REGION="${{ github.event.inputs.awsRegion || github.event.client_payload.aws_region || env.CLUSTER_REGION }}"
-        IMAGE_URI="${{ github.event.client_payload.image_uri }}"
+        aws-region: ${{ github.event.inputs.awsRegion }}
         
-        # Export as outputs
-        echo "app_name=${APP_NAME}" >> $GITHUB_OUTPUT
-        echo "repo_name=${REPO_NAME}" >> $GITHUB_OUTPUT
-        echo "container_port=${CONTAINER_PORT}" >> $GITHUB_OUTPUT
-        echo "cluster_name=${CLUSTER_NAME}" >> $GITHUB_OUTPUT
-        echo "aws_region=${AWS_REGION}" >> $GITHUB_OUTPUT
-        echo "image_uri=${IMAGE_URI}" >> $GITHUB_OUTPUT
-        
-        # Also set as environment variables
-        echo "APP_NAME=${APP_NAME}" >> $GITHUB_ENV
-        echo "REPO_NAME=${REPO_NAME}" >> $GITHUB_ENV
-        echo "CONTAINER_PORT=${CONTAINER_PORT}" >> $GITHUB_ENV
-        echo "CLUSTER_NAME=${CLUSTER_NAME}" >> $GITHUB_ENV
-        echo "AWS_REGION=${AWS_REGION}" >> $GITHUB_ENV
-        echo "IMAGE_URI=${IMAGE_URI}" >> $GITHUB_ENV
-    
-    - name: Display application info
+    - name: Wait for Cluster to be Ready
       run: |
-        echo "Deploying application: ${{ steps.app-vars.outputs.app_name }}"
-        echo "Repository: ${{ steps.app-vars.outputs.repo_name }}"
-        echo "Cluster: ${{ steps.app-vars.outputs.cluster_name }}"
-        echo "Region: ${{ steps.app-vars.outputs.aws_region }}"
-        echo "Container Port: ${{ steps.app-vars.outputs.container_port }}"
-        if [ -n "${{ steps.app-vars.outputs.image_uri }}" ]; then
-          echo "Image URI: ${{ steps.app-vars.outputs.image_uri }}"
-        fi
+        echo "Waiting for EKS cluster to be ready..."
+        aws eks wait cluster-active --name ${{ github.event.inputs.clusterName }} --region ${{ github.event.inputs.awsRegion }}
+        
+    - name: Update kubeconfig
+      run: |
+        aws eks --region ${{ github.event.inputs.awsRegion }} update-kubeconfig \
+          --name ${{ github.event.inputs.clusterName }}
+    
+    - name: Run post-deploy script
+      run: bash post-deploy.sh
+
+  build_and_deploy:
+    needs: terraform
+    runs-on: ubuntu-latest
+    if: ${{ github.event.inputs.action == 'deploy' }}
+    steps:
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v2
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ github.event.inputs.awsRegion }}
+    
+    - name: Login to Amazon ECR
+      id: login-ecr
+      uses: aws-actions/amazon-ecr-login@v1
+    
+    - name: Create ECR repository if it doesn't exist
+      run: |
+        aws ecr describe-repositories --repository-names ${{ github.event.inputs.appName }} || \
+        aws ecr create-repository --repository-name ${{ github.event.inputs.appName }}
+    
+    - name: Checkout application code
+      uses: actions/checkout@v3
+      with:
+        repository: ${{ github.repository_owner }}/${{ github.event.inputs.repoName }}
+        ref: main
+    
+    - name: Build and push Docker image
+      uses: docker/build-push-action@v4
+      with:
+        context: .
+        push: true
+        tags: ${{ steps.login-ecr.outputs.registry }}/${{ github.event.inputs.appName }}:latest
     
     - name: Update kubeconfig
       run: |
-        aws eks update-kubeconfig --region ${{ steps.app-vars.outputs.aws_region }} --name ${{ steps.app-vars.outputs.cluster_name }}
+        aws eks --region ${{ github.event.inputs.awsRegion }} update-kubeconfig \
+          --name ${{ github.event.inputs.clusterName }}
     
-    - name: Check if app should be deployed
-      id: check-deploy
+    - name: Deploy to Kubernetes
       run: |
-        # Skip deployment if app name is empty
-        if [ -z "${{ steps.app-vars.outputs.app_name }}" ]; then
-          echo "SHOULD_DEPLOY=false" >> $GITHUB_OUTPUT
-          echo "No application name provided. Skipping deployment."
-        else
-          echo "SHOULD_DEPLOY=true" >> $GITHUB_OUTPUT
-        fi
-    
-    - name: Create/Update deployment files
-      if: steps.check-deploy.outputs.SHOULD_DEPLOY == 'true'
-      run: |
-        mkdir -p deploy
-        
-        # Create deployment.yaml if we have an image URI
-        if [ -n "${{ steps.app-vars.outputs.image_uri }}" ]; then
-          cat > deploy/deployment.yaml << EOF
+        # Create or update deployment
+        cat <<EOF | kubectl apply -f -
         apiVersion: apps/v1
         kind: Deployment
         metadata:
-          name: ${{ steps.app-vars.outputs.app_name }}
-          labels:
-            app: ${{ steps.app-vars.outputs.app_name }}
+          name: ${{ github.event.inputs.appName }}
+          namespace: default
         spec:
           replicas: 2
           selector:
             matchLabels:
-              app: ${{ steps.app-vars.outputs.app_name }}
+              app: ${{ github.event.inputs.appName }}
           template:
             metadata:
               labels:
-                app: ${{ steps.app-vars.outputs.app_name }}
+                app: ${{ github.event.inputs.appName }}
             spec:
               containers:
-              - name: ${{ steps.app-vars.outputs.app_name }}
-                image: ${{ steps.app-vars.outputs.image_uri }}
+              - name: ${{ github.event.inputs.appName }}
+                image: ${{ steps.login-ecr.outputs.registry }}/${{ github.event.inputs.appName }}:latest
                 ports:
-                - containerPort: ${{ steps.app-vars.outputs.container_port }}
+                - containerPort: ${{ github.event.inputs.containerPort }}
                 env:
                 - name: NODE_ENV
                   value: "production"
+                - name: PORT
+                  value: "${{ github.event.inputs.containerPort }}"
+                livenessProbe:
+                  httpGet:
+                    path: /health
+                    port: ${{ github.event.inputs.containerPort }}
+                  initialDelaySeconds: 30
+                  periodSeconds: 10
+                readinessProbe:
+                  httpGet:
+                    path: /health
+                    port: ${{ github.event.inputs.containerPort }}
+                  initialDelaySeconds: 5
+                  periodSeconds: 5
         EOF
-        else
-          echo "No image URI provided. Skipping deployment manifest creation."
-        fi
         
-        # Create service.yaml regardless of image URI
-        cat > deploy/service.yaml << EOF
+        # Create or update service
+        cat <<EOF | kubectl apply -f -
         apiVersion: v1
         kind: Service
         metadata:
-          name: ${{ steps.app-vars.outputs.app_name }}-service
-          labels:
-            app: ${{ steps.app-vars.outputs.app_name }}
+          name: ${{ github.event.inputs.appName }}-service
+          namespace: default
         spec:
           selector:
-            app: ${{ steps.app-vars.outputs.app_name }}
+            app: ${{ github.event.inputs.appName }}
           ports:
           - port: 80
-            targetPort: ${{ steps.app-vars.outputs.container_port }}
+            targetPort: ${{ github.event.inputs.containerPort }}
           type: LoadBalancer
         EOF
     
-    - name: Deploy to Kubernetes
-      if: steps.check-deploy.outputs.SHOULD_DEPLOY == 'true'
-      run: |
-        # Only apply deployment if we have an image URI
-        if [ -n "${{ steps.app-vars.outputs.image_uri }}" ] && [ -f deploy/deployment.yaml ]; then
-          kubectl apply -f deploy/deployment.yaml
-        fi
-        
-        # Always apply service
-        kubectl apply -f deploy/service.yaml
-    
-    - name: Wait for deployment to be ready
-      if: steps.check-deploy.outputs.SHOULD_DEPLOY == 'true' && steps.app-vars.outputs.image_uri != ''
-      run: |
-        kubectl rollout status deployment/${{ steps.app-vars.outputs.app_name }} --timeout=180s
-    
     - name: Get Service URL
-      if: steps.check-deploy.outputs.SHOULD_DEPLOY == 'true'
       run: |
-        echo "====== Application Deployment Complete ======"
+        echo "Waiting for service to get external IP..."
+        kubectl wait --for=jsonpath='{.status.loadBalancer.ingress[0].hostname}' service/${{ github.event.inputs.appName }}-service --timeout=300s
         echo "Service URL:"
-        kubectl get service ${{ steps.app-vars.outputs.app_name }}-service -o jsonpath="{.status.loadBalancer.ingress[0].hostname}"
-        echo ""
-        echo "It may take a few minutes for the Load Balancer to be fully provisioned and the URL to become available."
+        kubectl get service ${{ github.event.inputs.appName }}-service -o jsonpath="{.status.loadBalancer.ingress[0].hostname}"
+
+  terraform_destroy:
+    runs-on: ubuntu-latest
+    if: ${{ github.event.inputs.action == 'remove' }}
+    defaults:
+      run:
+        working-directory: terraform
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+    
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v2
+      with:
+        cli_config_credentials_token: ${{ secrets.TF_API_TOKEN }}
+    
+    - name: Terraform Init
+      run: terraform init
+    
+    - name: Terraform Destroy
+      run: |
+        terraform destroy -auto-approve \
+          -var="region=${{ github.event.inputs.awsRegion }}" \
+          -var="cluster_name=${{ github.event.inputs.clusterName }}"
