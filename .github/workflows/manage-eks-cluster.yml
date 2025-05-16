@@ -32,23 +32,149 @@ on:
         default: '3000'
 
 jobs:
-  main-job:
+  deploy-job:
     runs-on: ubuntu-latest
+    if: github.event.inputs.action == 'deploy'
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
       
-      - name: Setup AWS credentials
+      - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v2
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ github.event.inputs.awsRegion }}
       
-      - name: Choose action
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          cli_config_credentials_token: ${{ secrets.TF_API_TOKEN }}
+      
+      - name: Create Terraform variables
+        working-directory: Terraform
         run: |
-          if [ "${{ github.event.inputs.action }}" == "deploy" ]; then
-            echo "Running deploy action"
-          else
-            echo "Running remove action"
-          fi
+          cat > terraform.auto.tfvars << EOF
+          region = "${{ github.event.inputs.awsRegion }}"
+          cluster_name = "${{ github.event.inputs.clusterName }}"
+          EOF
+      
+      - name: Terraform Init
+        working-directory: Terraform
+        run: terraform init
+      
+      - name: Terraform Apply
+        working-directory: Terraform
+        run: terraform apply -auto-approve
+      
+      - name: Update kubeconfig
+        run: |
+          aws eks --region ${{ github.event.inputs.awsRegion }} update-kubeconfig \
+            --name ${{ github.event.inputs.clusterName }}
+      
+      - name: Wait for cluster to be ready
+        run: sleep 60
+      
+      - name: Simple post-deploy
+        run: |
+          echo "Kubeconfig updated successfully!"
+      
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v1
+      
+      - name: Create ECR repository
+        run: |
+          aws ecr describe-repositories --repository-names ${{ github.event.inputs.appName }} || \
+          aws ecr create-repository --repository-name ${{ github.event.inputs.appName }}
+      
+      - name: Checkout application code
+        uses: actions/checkout@v3
+        with:
+          repository: ${{ github.repository_owner }}/${{ github.event.inputs.repoName }}
+          ref: main
+          path: app-code
+      
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v4
+        with:
+          context: app-code
+          push: true
+          tags: ${{ steps.login-ecr.outputs.registry }}/${{ github.event.inputs.appName }}:latest
+      
+      - name: Deploy application to Kubernetes
+        run: |
+          # Create deployment
+          kubectl create deployment ${{ github.event.inputs.appName }} \
+            --image=${{ steps.login-ecr.outputs.registry }}/${{ github.event.inputs.appName }}:latest \
+            --port=${{ github.event.inputs.containerPort }} || \
+          kubectl set image deployment/${{ github.event.inputs.appName }} \
+            ${{ github.event.inputs.appName }}=${{ steps.login-ecr.outputs.registry }}/${{ github.event.inputs.appName }}:latest
+          
+          # Create service
+          kubectl expose deployment ${{ github.event.inputs.appName }} \
+            --name=${{ github.event.inputs.appName }}-service \
+            --port=80 \
+            --target-port=${{ github.event.inputs.containerPort }} \
+            --type=LoadBalancer || \
+          echo "Service already exists"
+      
+      - name: Get Service URL
+        run: |
+          echo "Service URL might take a few minutes to be available"
+          kubectl get service ${{ github.event.inputs.appName }}-service
+
+  destroy-job:
+    runs-on: ubuntu-latest
+    if: github.event.inputs.action == 'remove'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ github.event.inputs.awsRegion }}
+      
+      - name: Try to connect to cluster and delete Kubernetes resources
+        run: |
+          # Try to connect to the cluster
+          aws eks --region ${{ github.event.inputs.awsRegion }} update-kubeconfig \
+            --name ${{ github.event.inputs.clusterName }} || true
+          
+          # Try to delete Kubernetes resources
+          kubectl delete service ${{ github.event.inputs.appName }}-service || true
+          kubectl delete deployment ${{ github.event.inputs.appName }} || true
+          
+          # Wait for resources to clean up
+          sleep 30
+      
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          cli_config_credentials_token: ${{ secrets.TF_API_TOKEN }}
+      
+      - name: Create Terraform variables
+        working-directory: Terraform
+        run: |
+          cat > terraform.auto.tfvars << EOF
+          region = "${{ github.event.inputs.awsRegion }}"
+          cluster_name = "${{ github.event.inputs.clusterName }}"
+          EOF
+      
+      - name: Terraform Init
+        working-directory: Terraform
+        run: terraform init
+      
+      - name: Terraform Destroy
+        working-directory: Terraform
+        run: terraform destroy -auto-approve || true
+      
+      - name: Cleanup additional resources
+        run: |
+          # Try to delete ECR repository
+          echo "Attempting to delete ECR repository..."
+          aws ecr delete-repository --repository-name ${{ github.event.inputs.appName }} \
+            --force --region ${{ github.event.inputs.awsRegion }} || true
