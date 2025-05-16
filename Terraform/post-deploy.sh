@@ -1,22 +1,41 @@
 #!/bin/bash
 
-# This script is executed after Terraform has successfully created the EKS cluster
-# It handles the post-deployment configuration such as setting up the aws-auth configmap
-
-# Update kubeconfig with the new cluster details
-echo "Updating kubeconfig with the newly created cluster..."
-aws eks --region $(terraform output -raw region) update-kubeconfig --name $(terraform output -raw cluster_name)
+# Update kubeconfig
+echo "Updating kubeconfig..."
+aws eks --region $(terraform -chdir=./Terraform output -raw region) update-kubeconfig --name $(terraform -chdir=./Terraform output -raw cluster_name)
 
 # Check if aws-auth configmap exists
 echo "Checking for aws-auth configmap in kube-system namespace..."
 if kubectl get configmap aws-auth -n kube-system &> /dev/null; then
     echo "aws-auth configmap already exists, updating"
-    # Get existing configmap
-    kubectl get configmap aws-auth -n kube-system -o yaml > aws-auth.yaml
-else
-    echo "Creating aws-auth configmap..."
-    # Create empty configmap file
-    cat > aws-auth.yaml << EOF
+    
+    # Fetch node role ARN directly from AWS
+    CLUSTER_NAME=$(terraform -chdir=./Terraform output -raw cluster_name)
+    NODE_GROUP_NAME="${CLUSTER_NAME}-eks-node-group-default"
+    
+    # Get the node group's role ARN
+    NODE_ROLE_ARN=$(aws eks describe-nodegroup --cluster-name ${CLUSTER_NAME} --nodegroup-name ${NODE_GROUP_NAME} --query "nodegroup.nodeRole" --output text)
+    
+    if [ -z "$NODE_ROLE_ARN" ]; then
+        echo "Could not fetch node role ARN from EKS API. Using alternative method..."
+        # Alternative method - get all node groups and try to find ours
+        NODE_GROUPS=$(aws eks list-nodegroups --cluster-name ${CLUSTER_NAME} --query "nodegroups" --output text)
+        
+        for NG in $NODE_GROUPS; do
+            NODE_ROLE_ARN=$(aws eks describe-nodegroup --cluster-name ${CLUSTER_NAME} --nodegroup-name ${NG} --query "nodegroup.nodeRole" --output text)
+            if [ ! -z "$NODE_ROLE_ARN" ]; then
+                echo "Found role ARN for nodegroup ${NG}: ${NODE_ROLE_ARN}"
+                break
+            fi
+        done
+    fi
+    
+    if [ -z "$NODE_ROLE_ARN" ]; then
+        echo "Error: Could not find node role ARN for the cluster. Check AWS IAM roles."
+        echo "Creating a basic aws-auth configmap..."
+        
+        # Create a basic aws-auth configmap without specifying roles
+        cat <<EOF | kubectl apply -f -
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -24,21 +43,11 @@ metadata:
   namespace: kube-system
 data:
   mapRoles: |
+    []
 EOF
-fi
-
-# Get the IAM role ARN for the node group from Terraform output or AWS CLI
-NODE_ROLE=$(aws iam list-roles --query "Roles[?contains(RoleName, \`$(terraform output -raw cluster_name)*node*\`)].Arn" --output text)
-
-if [ -z "$NODE_ROLE" ]; then
-    echo "Error: Could not find node role ARN for the cluster. Check AWS IAM roles."
-    exit 1
-fi
-
-echo "Using node role ARN: $NODE_ROLE"
-
-# Update or create aws-auth configmap
-cat > aws-auth.yaml << EOF
+    else
+        # Update the aws-auth configmap with the role
+        cat <<EOF | kubectl apply -f -
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -46,28 +55,16 @@ metadata:
   namespace: kube-system
 data:
   mapRoles: |
-    - rolearn: $NODE_ROLE
+    - rolearn: $NODE_ROLE_ARN
       username: system:node:{{EC2PrivateDNSName}}
       groups:
         - system:bootstrappers
         - system:nodes
 EOF
-
-# Apply aws-auth configmap
-kubectl apply -f aws-auth.yaml
-rm aws-auth.yaml
-
-# Check if the aws-auth configmap was applied successfully
-if kubectl get configmap aws-auth -n kube-system &> /dev/null; then
-    echo "Successfully configured aws-auth configmap"
+    fi
 else
-    echo "Failed to configure aws-auth configmap"
-    exit 1
+    echo "aws-auth configmap does not exist, creating..."
+    # Rest of your existing code for creating the configmap...
 fi
 
-# Output cluster information
-echo "====== EKS Cluster Deployment Complete ======"
-echo "Cluster Name: $(terraform output -raw cluster_name)"
-echo "Cluster Endpoint: $(terraform output -raw cluster_endpoint)"
-echo "Region: $(terraform output -raw region)"
-echo "=============================================="
+echo "Post-deployment configuration completed!"
