@@ -86,15 +86,85 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ github.event.inputs.awsRegion }}
       
-      - name: Try to connect to cluster and update status
+      - name: Clean up Kubernetes resources and Load Balancers
         run: |
-          # Try to connect to the cluster
-          echo "Checking if cluster exists..."
+          echo "🧹 Starting comprehensive cleanup process..."
+          
+          # Try to connect to the cluster first
           if aws eks describe-cluster --name ${{ github.event.inputs.clusterName }} --region ${{ github.event.inputs.awsRegion }} &> /dev/null; then
-            echo "Cluster exists, will proceed with destruction"
+            echo "✅ Cluster exists, connecting and cleaning up Kubernetes resources..."
+            
+            # Update kubeconfig
+            aws eks --region ${{ github.event.inputs.awsRegion }} update-kubeconfig --name ${{ github.event.inputs.clusterName }}
+            
+            # Get all LoadBalancer services before deleting them
+            echo "🔍 Finding LoadBalancer services..."
+            SERVICES=$(kubectl get services --all-namespaces -o jsonpath='{range .items[?(@.spec.type=="LoadBalancer")]}{.metadata.namespace}{"|"}{.metadata.name}{"\n"}{end}' || echo "")
+            
+            if [ ! -z "$SERVICES" ]; then
+              echo "📋 Found LoadBalancer services:"
+              echo "$SERVICES"
+              
+              # Delete each LoadBalancer service
+              echo "$SERVICES" | while IFS='|' read -r namespace service_name; do
+                if [ ! -z "$service_name" ]; then
+                  echo "🗑️  Deleting service $service_name in namespace $namespace..."
+                  kubectl delete service "$service_name" -n "$namespace" --ignore-not-found=true
+                fi
+              done
+              
+              # Wait for Load Balancers to be cleaned up
+              echo "⏳ Waiting 60 seconds for AWS Load Balancers to be deleted..."
+              sleep 60
+            fi
+            
+            # Delete all deployments, services, and other resources
+            echo "🗑️  Deleting all Kubernetes resources..."
+            kubectl delete all --all --all-namespaces --ignore-not-found=true || true
+            
+            # Wait additional time for cleanup
+            echo "⏳ Waiting additional 30 seconds for cleanup..."
+            sleep 30
           else
-            echo "Cluster doesn't exist, but will continue with Terraform destroy"
+            echo "⚠️  Cluster doesn't exist, skipping Kubernetes cleanup"
           fi
+      
+      - name: Force cleanup any remaining Load Balancers
+        run: |
+          echo "🔍 Checking for any remaining Load Balancers..."
+          
+          # Find Load Balancers by cluster tag
+          LB_ARNS=$(aws elbv2 describe-load-balancers --output text --query "LoadBalancers[].LoadBalancerArn" || echo "")
+          
+          if [ ! -z "$LB_ARNS" ]; then
+            for LB_ARN in $LB_ARNS; do
+              # Check if this Load Balancer has the cluster tag
+              TAGS=$(aws elbv2 describe-tags --resource-arns "$LB_ARN" --output text --query "TagDescriptions[0].Tags[?Key=='kubernetes.io/cluster/${{ github.event.inputs.clusterName }}'].Value" || echo "")
+              
+              if [ ! -z "$TAGS" ]; then
+                echo "🗑️  Force deleting Load Balancer: $LB_ARN"
+                aws elbv2 delete-load-balancer --load-balancer-arn "$LB_ARN" || true
+              fi
+            done
+          fi
+          
+          # Also check for classic Load Balancers (ELB v1)
+          CLB_NAMES=$(aws elb describe-load-balancers --output text --query "LoadBalancerDescriptions[].LoadBalancerName" || echo "")
+          
+          if [ ! -z "$CLB_NAMES" ]; then
+            for CLB_NAME in $CLB_NAMES; do
+              # Check if this Classic Load Balancer has the cluster tag
+              TAGS=$(aws elb describe-tags --load-balancer-names "$CLB_NAME" --output text --query "TagDescriptions[0].Tags[?Key=='kubernetes.io/cluster/${{ github.event.inputs.clusterName }}'].Value" || echo "")
+              
+              if [ ! -z "$TAGS" ]; then
+                echo "🗑️  Force deleting Classic Load Balancer: $CLB_NAME"
+                aws elb delete-load-balancer --load-balancer-name "$CLB_NAME" || true
+              fi
+            done
+          fi
+          
+          echo "⏳ Waiting for Load Balancers to finish deleting..."
+          sleep 30
       
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v2
@@ -117,12 +187,24 @@ jobs:
         working-directory: Terraform
         run: terraform destroy -auto-approve || true
       
-      - name: Cleanup verification
+      - name: Final cleanup verification
         run: |
-          echo "Verifying deletion of EKS cluster..."
+          echo "🔍 Performing final verification..."
+          
+          # Check if cluster still exists
           if aws eks describe-cluster --name ${{ github.event.inputs.clusterName }} --region ${{ github.event.inputs.awsRegion }} &> /dev/null; then
-            echo "Warning: Cluster still exists. It may still be in the process of being deleted."
-            echo "Check the AWS Management Console for status."
+            echo "⚠️  Cluster still exists, attempting force deletion..."
+            aws eks delete-cluster --name ${{ github.event.inputs.clusterName }} --region ${{ github.event.inputs.awsRegion }} || true
           else
-            echo "Cluster ${{ github.event.inputs.clusterName }} has been successfully deleted!"
+            echo "✅ Cluster successfully deleted"
           fi
+          
+          # Check for any remaining Load Balancers one more time
+          REMAINING_LBS=$(aws elbv2 describe-load-balancers --output text --query "LoadBalancers[].LoadBalancerArn" | wc -w || echo "0")
+          if [ "$REMAINING_LBS" -gt 0 ]; then
+            echo "⚠️  $REMAINING_LBS Load Balancer(s) still exist - they may still be deleting"
+          else
+            echo "✅ No Load Balancers found"
+          fi
+          
+          echo "🎉 Cleanup process completed!"
