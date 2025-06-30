@@ -65,17 +65,10 @@ jobs:
       - name: Wait for cluster to be ready
         run: sleep 60
       
-      - name: Apply RBAC configuration
-        run: |
-          echo "Applying RBAC configuration for GitHub Actions deployments..."
-          kubectl apply -f k8s-rbac.yaml
-          echo "RBAC configuration applied successfully!"
-      
       - name: Simple post-deploy
         run: |
           echo "Kubeconfig updated successfully!"
           echo "EKS cluster ${{ github.event.inputs.clusterName }} has been created!"
-          echo "RBAC configuration has been applied for GitHub Actions deployments!"
           echo "To connect to your cluster, run:"
           echo "aws eks --region ${{ github.event.inputs.awsRegion }} update-kubeconfig --name ${{ github.event.inputs.clusterName }}"
 
