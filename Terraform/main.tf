@@ -95,8 +95,7 @@ module "eks" {
     }
   }
 
-  # Disable aws-auth configmap management to avoid the connection error
-  manage_aws_auth_configmap = false
+  # aws-auth configmap management is handled differently in v20+
 
   tags = {
     Environment = "dev"
