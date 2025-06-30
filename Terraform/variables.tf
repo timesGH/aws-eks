@@ -7,7 +7,7 @@ variable "region" {
 variable "cluster_version" {
   description = "Kubernetes cluster version"
   type        = string
-  default     = "1.27"
+  default     = "1.28"
 }
 
 variable "cluster_name" {
@@ -50,4 +50,22 @@ variable "app_name" {
   description = "Name of the application to be deployed in EKS"
   type        = string
   default     = "nodejs-app"
+}
+
+variable "terraform_organization" {
+  description = "Terraform Cloud organization name"
+  type        = string
+  default     = "Honours"
+}
+
+variable "terraform_workspace" {
+  description = "Terraform Cloud workspace name"
+  type        = string
+  default     = "eks-demo"
+}
+
+variable "allowed_cidr_blocks" {
+  description = "List of CIDR blocks that can access the EKS cluster endpoint"
+  type        = list(string)
+  default     = ["0.0.0.0/0"]
 }

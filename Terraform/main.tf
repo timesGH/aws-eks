@@ -11,11 +11,11 @@ terraform {
   }
   backend "remote" {
     # The name of your Terraform Cloud organization.
-    organization = "Honours"
+    organization = var.terraform_organization
 
     # The name of the Terraform Cloud workspace to store Terraform state files in.
     workspaces {
-      name = "eks-demo"
+      name = var.terraform_workspace
     }
   }
 }
@@ -49,7 +49,8 @@ module "vpc" {
   public_subnets  = ["10.0.4.0/24", "10.0.5.0/24", "10.0.6.0/24"]
 
   enable_nat_gateway   = true
-  single_nat_gateway   = true
+  single_nat_gateway   = false
+  one_nat_gateway_per_az = true
   enable_dns_hostnames = true
 
   # Tags required by EKS
@@ -76,7 +77,9 @@ module "eks" {
   cluster_name    = var.cluster_name
   cluster_version = var.cluster_version
 
-  cluster_endpoint_public_access = true
+  cluster_endpoint_public_access       = true
+  cluster_endpoint_public_access_cidrs = var.allowed_cidr_blocks
+  cluster_endpoint_private_access      = true
 
   # Use the VPC created above
   vpc_id     = module.vpc.vpc_id

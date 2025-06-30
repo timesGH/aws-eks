@@ -1,6 +1,6 @@
-# ${{ values.name }}
+# AWS EKS Infrastructure
 
-${{ values.description }}
+This repository contains Terraform infrastructure code for deploying an AWS EKS (Elastic Kubernetes Service) cluster with supporting resources.
 
 ## Deployment to AWS EKS
 
@@ -55,7 +55,7 @@ npm install
 npm start
 ```
 
-The application will be available at http://localhost:${{ values.containerPort }}
+The application will be available at http://localhost:3000
 
 ## Dockerfile
 
@@ -63,8 +63,8 @@ The included Dockerfile builds the application for production use. To build and 
 
 ```bash
 # Build the image
-docker build -t ${{ values.name | lower | replace(' ', '-') }}:latest .
+docker build -t aws-eks-app:latest .
 
 # Run the container
-docker run -p ${{ values.containerPort }}:${{ values.containerPort }} ${{ values.name | lower | replace(' ', '-') }}:latest
+docker run -p 3000:3000 aws-eks-app:latest
 ```
